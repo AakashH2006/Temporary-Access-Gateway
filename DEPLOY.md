@@ -24,6 +24,12 @@ the secret.** A customer never receives VPN credentials, never gets a route
 into the internal network, and can only reach whatever single upstream
 `UPSTREAM_URL` names.
 
+**Showing it rather than shipping it?** `docker compose up --build` runs the
+whole system on a laptop, with a stand-in for the internal app -- see
+[README.md](README.md#running-the-demo). The rest of this file is the real
+deployment; ["A demo on a public URL"](#a-demo-on-a-public-url) at the end is
+the short path between the two.
+
 ---
 
 ## 1. Host prerequisites
@@ -65,11 +71,20 @@ CREATE USER temp_access_user WITH PASSWORD 'CHANGE-ME';
 CREATE DATABASE temp_access OWNER temp_access_user;
 SQL
 
-psql "postgres://temp_access_user:CHANGE-ME@localhost:5432/temp_access" -f schema.sql
+```
+
+Then apply the schema. Do this after step 4, once `.env` holds the
+`DATABASE_URL` -- `npm run migrate` reads it from there, and uses the same `pg`
+driver the application does, so it needs no Postgres client tools installed:
+
+```bash
+sudo -u tempaccess npm run migrate
 ```
 
 `schema.sql` is written to be re-runnable, so applying it again on upgrade is
-safe.
+safe -- and is the upgrade step. There is no version table and no down
+direction; if that stops being enough, that is the moment to adopt a real
+migration tool rather than to hand-edit the database.
 
 ## 4. Configuration
 
@@ -101,6 +116,11 @@ The values that actually decide whether this works:
 | `AUDIT_RETENTION_MONTHS` | your policy, default 12 | Only read by `npm run prune-audit`. Nothing is deleted until that runs. |
 | `MAX_DURATION_HOURS` | `24` | A ceiling on the access window, not a default. Same value if unset, so dropping it cannot widen the ceiling. |
 | `PENDING_EXPIRY_HOURS` | `24` | How long an unopened link stays activatable. Unset, the code default is also 24. Not the same clock as the one above. |
+| `ADMIN_REQUIRE_TOTP` | `true` | Left off, a stolen or phished admin password is enough to mint access to the internal network. Turning it on does not lock anyone out -- they sign in and are shown the enrolment screen and nothing else. |
+| `REQUIRE_GRANT_REASON` | `true` if anyone will audit this | Left off, nothing records *why* a window of access was opened, and it cannot be reconstructed later. |
+| `METRICS_TOKEN` | 32 random bytes | Left empty, `/__access/metrics` returns 404 and you have no numbers. Set, it is served only to a caller presenting the bearer token. |
+| `WEBHOOK_URL` / `WEBHOOK_SECRET` | your SIEM or SOC channel | Left empty, nothing is sent. Set the URL without the secret and the receiver is trusting anyone who learns the URL. |
+| `LOG_FORMAT` | leave unset | Defaults to `json` when stdout is not a terminal, which is what systemd gives it. Set `pretty` only if a human is reading the journal directly. |
 
 Lock the file down — it holds the key to the internal network:
 
@@ -123,6 +143,29 @@ when the table is empty.
 This same command is the recovery path: re-running it for an existing email
 resets the password and clears any lockout. Losing an admin password therefore
 requires SSH to fix, which is itself a control worth keeping.
+
+The account it creates is an **owner** -- the only role that can add anyone
+else. Add the rest of the team from the console rather than from here: those
+accounts are created with a temporary password that must be changed at first
+sign-in, and the whole thing is audited with both parties named.
+
+```bash
+# Or create a colleague directly, at a narrower role.
+sudo -u tempaccess npm run create-admin -- them@example.com --role=auditor
+```
+
+**Two-factor.** With `ADMIN_REQUIRE_TOTP=true` in `.env`, enrol before you hand
+the console to anyone:
+
+1. Sign in and open **Security**.
+2. Add the key shown there to an authenticator app and enter the code.
+3. **Save the ten recovery codes.** They are shown once. Without them, a lost
+   phone means SSH and SQL.
+
+There is no way for one admin to reset another's second factor. An owner can
+disable the account and issue a new one, which is auditable; being able to
+impersonate a colleague is not a feature worth having in the system that opens
+the internal network.
 
 ## 5. Service
 
@@ -238,7 +281,10 @@ for you.
 
 ```bash
 curl -sS https://access.example.com/__access/health
-# {"ok":true,"upstream":"http://10.x.x.x:8080"}
+# {"ok":true,"database":"ok"}
+# 503 {"ok":false,"database":"unreachable"} if Postgres is unreachable, which
+# is the honest answer: no grant can be read, so nobody is getting in.
+# It deliberately does not name the upstream -- this URL answers anonymously.
 
 curl -sSI https://access.example.com/
 # HTTP/2 302 ... location: /__access/login?next=%2F&reason=no_session
@@ -334,7 +380,7 @@ handover, and again after any change of provider or sending domain.
 cd /opt/temp-access
 sudo -u tempaccess git pull
 sudo -u tempaccess npm ci --omit=dev
-psql "$DATABASE_URL" -f schema.sql     # re-runnable
+sudo -u tempaccess npm run migrate     # re-runnable
 sudo systemctl restart temp-access
 ```
 
@@ -368,10 +414,94 @@ Check what it would remove first with `npm run prune-audit -- --dry-run`. The
 prune writes an `AUDIT_PRUNED` row of its own, so the shortening is itself in
 the log.
 
-**Monitoring.** `GET /__access/health` is unauthenticated by design -- point an
-uptime check at it. The gateway being down does not merely degrade the app: it
+The same job sweeps delivered `webhook_outbox` rows after
+`WEBHOOK_RETENTION_DAYS` (30). Failed ones are never swept.
+
+**Monitoring.** The gateway being down does not merely degrade the app: it
 makes the app unreachable for every temporary user, and the people affected are
 the ones least able to tell you.
+
+Two probes, and they are not interchangeable:
+
+| Probe | Checks | Use it for |
+|---|---|---|
+| `GET /__access/health/live` | the process only | restart policy |
+| `GET /__access/health/ready` | the process **and** Postgres | load-balancer membership, uptime checks |
+
+Do not point a restart policy at readiness. A liveness probe that checks the
+database tells the supervisor to restart the gateway every time Postgres has a
+bad minute, so a blip the connection pool would have ridden out becomes a
+restart loop that lasts as long as the blip. `GET /__access/health` still
+answers as an alias for readiness, so an existing check keeps working.
+
+**Metrics.** Set `METRICS_TOKEN` and scrape `/__access/metrics`:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: temp-access
+    metrics_path: /__access/metrics
+    authorization: { credentials: "<METRICS_TOKEN>" }
+    static_configs: [{ targets: ["access.example.com:443"] }]
+    scheme: https
+```
+
+Four alerts worth having on day one:
+
+| Alert | Expression | Why |
+|---|---|---|
+| Gateway down | `up == 0` | Nobody can reach the app |
+| Upstream unreachable | `rate(gateway_upstream_errors_total[5m]) > 0` | The gateway is fine and the app behind it is not |
+| Admin sign-in being guessed | `rate(gateway_logins_total{principal="admin",outcome!="success"}[15m]) > 0.1` | The credential that mints access is under attack |
+| Webhook feed stalled | `gateway_webhook_outbox_pending > 50` | Security events are being recorded and not delivered |
+
+`gateway_grants_live` is the one to put on a dashboard: it is the answer to
+*how many people can reach the internal network right now*, which is a question
+worth being able to answer without opening the console.
+
+**Webhooks.** If `WEBHOOK_URL` is set, the receiver must verify the signature.
+The gateway sends `X-Gateway-Signature: sha256=<hex>`, computed as an HMAC-SHA256
+of `<timestamp>.<raw body>` using `WEBHOOK_SECRET`, with the timestamp in
+`X-Gateway-Timestamp`:
+
+```js
+const expected = crypto.createHmac('sha256', SECRET)
+  .update(`${req.headers['x-gateway-timestamp']}.${rawBody}`)
+  .digest('hex');
+
+// Constant-time, and reject anything older than five minutes -- the timestamp
+// is inside the signed string precisely so a captured body cannot be replayed.
+const fresh = Math.abs(Date.now() / 1000 - Number(req.headers['x-gateway-timestamp'])) < 300;
+const ok = fresh && crypto.timingSafeEqual(
+  Buffer.from(expected),
+  Buffer.from(String(req.headers['x-gateway-signature']).replace('sha256=', ''))
+);
+```
+
+Answer `2xx` to acknowledge. Anything else is retried with exponential backoff
+for `WEBHOOK_MAX_ATTEMPTS` tries and then marked `FAILED` and left in the
+`webhook_outbox` table, where it stays -- a security event that was never
+delivered is exactly what someone will want to find later:
+
+```sql
+SELECT id, event, attempts, last_error, created_at
+  FROM webhook_outbox WHERE status = 'FAILED' ORDER BY id DESC LIMIT 20;
+```
+
+**Logs.** Under systemd, stdout is not a terminal, so the gateway emits one
+JSON object per line. Every line for a single request carries the same
+`requestId`, which is also returned to the caller in the `X-Request-Id`
+response header and stored on the `audit_log` row -- so a customer quoting the
+header from an error page is handing you the exact request:
+
+```bash
+sudo journalctl -u temp-access -o cat | jq 'select(.requestId == "<id>")'
+sudo journalctl -u temp-access -o cat | jq 'select(.level == "error")'
+```
+
+`LOG_LEVEL=debug` adds a line per proxied request. On a reverse proxy that is
+every image and stylesheet the upstream app pulls in -- useful for an hour
+while diagnosing, expensive as a steady state.
 
 **Log rotation.** Everything goes to the systemd journal, which is not capped
 by default on every distro:
@@ -456,3 +586,62 @@ question gets answered months later.
 | All audit rows share one IP | `TRUST_PROXY` is not `true` while nginx is in front. |
 | Everyone rate-limited at once | Same cause. |
 | App's links point at the internal hostname | The app has a hardcoded base URL. Configure the app to use `https://access.example.com`, or have it honour `X-Forwarded-Host`. |
+
+---
+
+## A demo on a public URL
+
+For a demo somebody else has to reach -- a client, a colleague in another
+office -- on a single throwaway VM. This is not the deployment above and does
+not pretend to be: it exists to be shown and then destroyed.
+
+```bash
+# On the VM, with Docker installed and 80/443 open.
+git clone <your-repo> temp-access && cd temp-access
+
+cat > .env <<ENV
+JWT_SECRET=$(openssl rand -base64 48 | tr -d '=+/')
+PUBLIC_BASE_URL=https://demo.example.com
+GATEWAY_PORT=127.0.0.1:3000
+TRUST_PROXY=true
+DEMO_ADMIN_EMAIL=you@yourcompany.com
+ENV
+
+docker compose up --build -d
+docker compose logs bootstrap        # the admin password
+```
+
+Four things must change from the laptop defaults, and each one is a way the
+demo goes wrong if it doesn't:
+
+1. **`JWT_SECRET`.** The compose default is in the repo, so anyone reading it
+   can mint a session cookie for any email. On a public URL that is not a
+   theoretical problem.
+2. **`GATEWAY_PORT=127.0.0.1:3000`** binds the published port to loopback, so
+   the only way in is through the TLS proxy below. Without the prefix Docker
+   publishes on every interface and answers plain HTTP on :3000 -- with, on
+   most cloud VMs, a firewall rule the daemon added for you.
+3. **`PUBLIC_BASE_URL`** must be the https:// hostname people will actually
+   type. Every access link is built from it, so a wrong value emails links
+   that go nowhere -- and it is also what switches the session cookie to
+   `Secure`.
+4. **TLS in front.** Caddy is two lines and gets a certificate on its own:
+
+   ```
+   demo.example.com {
+     reverse_proxy 127.0.0.1:3000
+   }
+   ```
+
+   `TRUST_PROXY=true` belongs with it, in the same change: without it every
+   visitor shares one rate-limit bucket and the audit log records the proxy's
+   address for all of them. Setting it *without* a proxy is the worse mistake
+   -- then any client can spoof its own address in both.
+   `deploy/nginx.conf` is the nginx equivalent, and section 6 covers it
+   properly.
+
+Still demo-shaped after all that: the database password is the compose default
+in a container with no backups, `demo-app` stands in for the real application,
+and the admin console answers anyone who reaches the URL --
+`ADMIN_IP_ALLOWLIST` is the fix, and section 7 is the rest of it. Take it down
+with `docker compose down -v` when the demo is over, and destroy the VM.

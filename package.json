@@ -11,10 +11,14 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "demo-app": "node demo-app/app.js",
-    "migrate": "psql \"$DATABASE_URL\" -f schema.sql",
+    "migrate": "node scripts/migrate.js",
     "create-admin": "node scripts/create-admin.js",
-    "test": "node --test",
-    "prune-audit": "node scripts/prune-audit.js"
+    "test": "node --test --test-concurrency=1",
+    "prune-audit": "node scripts/prune-audit.js",
+    "demo": "docker compose up --build -d && docker compose logs bootstrap",
+    "demo:logs": "docker compose logs -f gateway demo-app",
+    "demo:down": "docker compose down",
+    "demo:reset": "docker compose down -v"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

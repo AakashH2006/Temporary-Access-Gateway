@@ -16,76 +16,281 @@
     <div class="ticket-body">
 
       <div class="whoami">
-        <span>Signed in as <b id="whoEmail"></b></span>
+        <span>Signed in as <b id="whoEmail"></b> <span class="badge role" id="whoRole"></span></span>
         <button class="mini neutral" id="signOut">Sign out</button>
       </div>
 
-      <div class="row">
-        <div>
-          <label for="email">Customer email</label>
-          <input id="email" type="email" placeholder="customer@business.com" />
-        </div>
-        <div>
-          <label for="duration">Access duration</label>
-          <select id="duration">
-            <option value="1">1 hour</option>
-            <option value="4">4 hours</option>
-            <option value="8" selected>8 hours</option>
-            <option value="24">24 hours</option>
-            <option value="72">3 days</option>
-            <option value="168">7 days</option>
-          </select>
-        </div>
+      <!-- Shown when the server has told us this account may do nothing else
+           until it fixes its own credentials. The tabs are hidden alongside,
+           so this is not a nag beside a console that still works. -->
+      <div class="notice" id="forced" style="display:none">
+        <p class="notice-title" id="forcedTitle"></p>
+        <p class="muted" id="forcedDetail"></p>
       </div>
 
-      <p class="muted" id="clockHint">&nbsp;</p>
+      <nav class="tabs" id="tabs">
+        <button class="tab on" data-panel="access">Access</button>
+        <button class="tab" data-panel="audit">Audit log</button>
+        <button class="tab" data-panel="team" id="tabTeam" hidden>Team</button>
+        <button class="tab" data-panel="security">Security</button>
+      </nav>
 
-      <button class="primary" id="submit">Grant access</button>
-      <div class="error-text" id="errorText"></div>
+      <!-- ============================== Access ============================== -->
+      <section id="panel-access">
+        <div id="issueForm">
+          <div class="row">
+            <div>
+              <label for="email">Customer email</label>
+              <input id="email" type="email" placeholder="customer@business.com" />
+            </div>
+            <div>
+              <label for="duration">Access duration</label>
+              <select id="duration">
+                <option value="1">1 hour</option>
+                <option value="4">4 hours</option>
+                <option value="8" selected>8 hours</option>
+                <option value="24">24 hours</option>
+                <option value="72">3 days</option>
+                <option value="168">7 days</option>
+              </select>
+            </div>
+          </div>
 
-      <!-- Shown when the address already has a live grant: before submit from
-           the lookup, or after a 409. Revoking is never automatic -- it ends
-           whatever the current holder is doing, so it takes a click that says
-           so. -->
-      <div class="notice" id="collision" style="display:none">
-        <p class="notice-title" id="collisionTitle"></p>
-        <p class="muted" id="collisionDetail"></p>
+          <label for="reason" id="reasonLabel">Reason <span class="muted">(optional)</span></label>
+          <input id="reason" type="text" maxlength="500"
+                 placeholder="INC-4821 — vendor debugging the billing export" />
+
+          <p class="muted" id="clockHint">&nbsp;</p>
+
+          <button class="primary" id="submit">Grant access</button>
+          <div class="error-text" id="errorText"></div>
+        </div>
+
+        <!-- Shown when the address already has a live grant: before submit from
+             the lookup, or after a 409. Revoking is never automatic -- it ends
+             whatever the current holder is doing, so it takes a click that says
+             so. -->
+        <div class="notice" id="collision" style="display:none">
+          <p class="notice-title" id="collisionTitle"></p>
+          <p class="muted" id="collisionDetail"></p>
+          <p class="muted">
+            Revoking ends any session in progress <b>immediately</b> — if they are
+            working in the application right now, they are signed out mid-task.
+          </p>
+          <div class="notice-actions">
+            <button class="mini" id="revokeReissue">Revoke and reissue</button>
+            <button class="mini neutral" id="collisionDismiss">Leave it alone</button>
+          </div>
+        </div>
+
+        <div id="resultWrap" style="display:none; margin-top:20px">
+          <div class="kv"><span>Status</span><span id="rStatus">&mdash;</span></div>
+          <div class="kv"><span>Email</span><span id="rEmail">&mdash;</span></div>
+          <div class="cred" id="rUrl"></div>
+          <div id="rPasswordWrap" style="display:none">
+            <p class="muted" id="rPasswordNote" style="margin:12px 0 0"></p>
+            <div class="cred" id="rPassword"></div>
+          </div>
+        </div>
+
+        <h2>Recent grants</h2>
+        <div class="filters">
+          <div>
+            <label for="filterStatus">Status</label>
+            <select id="filterStatus">
+              <option value="">Any</option>
+              <option value="PENDING,ACTIVE" selected>Live (pending or active)</option>
+              <option value="ACTIVE">Active</option>
+              <option value="PENDING">Pending</option>
+              <option value="EXPIRED">Expired</option>
+              <option value="REVOKED">Revoked</option>
+            </select>
+          </div>
+          <div>
+            <label for="filterEmail">Email</label>
+            <input id="filterEmail" type="email" placeholder="anyone" />
+          </div>
+        </div>
+        <p class="muted" id="listHint">Loading&hellip;</p>
+        <div class="table-scroll">
+          <table id="grantsTable" style="display:none">
+            <thead>
+              <tr>
+                <th>Email</th>
+                <th>Status</th>
+                <th>Activated</th>
+                <th>Expires</th>
+                <th>Reason</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="grantsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============================== Audit ============================== -->
+      <section id="panel-audit" hidden>
+        <h2>Audit log</h2>
         <p class="muted">
-          Revoking ends any session in progress <b>immediately</b> — if they are
-          working in the application right now, they are signed out mid-task.
+          Append-only. Every authorization decision the gateway has made, including
+          the ones nobody was watching.
         </p>
-        <div class="notice-actions">
-          <button class="mini" id="revokeReissue">Revoke and reissue</button>
-          <button class="mini neutral" id="collisionDismiss">Leave it alone</button>
+        <div class="filters">
+          <div>
+            <label for="aEvent">Event</label>
+            <input id="aEvent" type="text" placeholder="GRANT_REVOKED,LOGIN_FAILED" />
+          </div>
+          <div>
+            <label for="aActor">Actor</label>
+            <input id="aActor" type="text" placeholder="anyone" />
+          </div>
+          <div>
+            <label for="aFrom">From</label>
+            <input id="aFrom" type="date" />
+          </div>
+          <div>
+            <label for="aTo">To</label>
+            <input id="aTo" type="date" />
+          </div>
         </div>
-      </div>
-
-      <div id="resultWrap" style="display:none; margin-top:20px">
-        <div class="kv"><span>Status</span><span id="rStatus">&mdash;</span></div>
-        <div class="kv"><span>Email</span><span id="rEmail">&mdash;</span></div>
-        <div class="cred" id="rUrl"></div>
-        <div id="rPasswordWrap" style="display:none">
-          <p class="muted" id="rPasswordNote" style="margin:12px 0 0"></p>
-          <div class="cred" id="rPassword"></div>
+        <div class="notice-actions" style="margin-top:14px">
+          <button class="mini neutral" id="aLoad">Apply</button>
+          <button class="mini neutral" id="aClear">Clear</button>
+          <button class="mini go" id="aExport">Export CSV</button>
         </div>
-      </div>
+        <p class="muted" id="aHint" style="margin-top:14px">Not loaded yet.</p>
+        <div class="table-scroll">
+          <table id="auditTable" style="display:none">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Event</th>
+                <th>Actor</th>
+                <th>IP</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody id="auditBody"></tbody>
+          </table>
+        </div>
+      </section>
 
-      <h1 style="font-size:16px;margin:32px 0 0">Recent grants</h1>
-      <p class="muted" id="listHint">Loading&hellip;</p>
-      <div class="table-scroll">
-        <table id="grantsTable" style="display:none">
-          <thead>
-            <tr>
-              <th>Email</th>
-              <th>Status</th>
-              <th>Activated</th>
-              <th>Expires</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="grantsBody"></tbody>
-        </table>
-      </div>
+      <!-- ============================== Team ============================== -->
+      <section id="panel-team" hidden>
+        <h2>Admin accounts</h2>
+        <p class="muted">
+          Anyone listed here can reach the console. An <b>owner</b> manages this list;
+          an <b>admin</b> issues and revokes access; an <b>auditor</b> can only read.
+        </p>
+        <p class="muted" id="teamHint">Loading&hellip;</p>
+        <div class="table-scroll">
+          <table id="teamTable" style="display:none">
+            <thead>
+              <tr>
+                <th>Email</th>
+                <th>Role</th>
+                <th>2FA</th>
+                <th>Last sign-in</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="teamBody"></tbody>
+          </table>
+        </div>
+
+        <div id="teamCreate" hidden>
+          <h2>Add an admin</h2>
+          <div class="row">
+            <div>
+              <label for="newAdminEmail">Email</label>
+              <input id="newAdminEmail" type="email" placeholder="colleague@yourcompany.com" />
+            </div>
+            <div>
+              <label for="newAdminRole">Role</label>
+              <select id="newAdminRole">
+                <option value="admin" selected>Admin</option>
+                <option value="auditor">Auditor</option>
+                <option value="owner">Owner</option>
+              </select>
+            </div>
+          </div>
+          <button class="primary" id="newAdminSubmit">Create account</button>
+          <div class="error-text" id="teamError"></div>
+          <div id="newAdminResult" style="display:none; margin-top:18px">
+            <p class="muted">
+              Temporary password for <b id="newAdminWho"></b>. Read it to them over a channel
+              you trust — it is shown once, and they must change it at first sign-in.
+            </p>
+            <div class="cred" id="newAdminPassword"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============================ Security ============================ -->
+      <section id="panel-security" hidden>
+        <h2>Change password</h2>
+        <label for="curPw">Current password</label>
+        <input id="curPw" type="password" autocomplete="current-password" />
+        <label for="newPw">New password</label>
+        <input id="newPw" type="password" autocomplete="new-password" />
+        <label for="newPw2">Confirm new password</label>
+        <input id="newPw2" type="password" autocomplete="new-password" />
+        <button class="primary" id="pwSubmit">Update password</button>
+        <div class="error-text" id="pwError"></div>
+        <div class="ok-text" id="pwOk"></div>
+
+        <h2>Two-factor authentication</h2>
+        <p class="muted" id="totpState">Checking&hellip;</p>
+
+        <div id="totpOff">
+          <button class="ghost" id="totpStart">Set up an authenticator app</button>
+          <div id="totpEnrol" style="display:none; margin-top:16px">
+            <p class="muted">
+              Add this key to your authenticator app, then enter the six-digit code it
+              shows. Most apps accept a manual entry — paste the key, or the full
+              setup URI below it.
+            </p>
+            <div class="cred" id="totpSecret"></div>
+            <div class="cred" id="totpUri"></div>
+            <label for="totpCode">Code from the app</label>
+            <input id="totpCode" type="text" inputmode="numeric" autocomplete="one-time-code"
+                   maxlength="6" placeholder="000000" />
+            <button class="primary" id="totpEnable">Turn on two-factor</button>
+          </div>
+        </div>
+
+        <div id="totpOn" style="display:none">
+          <div class="notice-actions">
+            <button class="mini go" id="totpNewCodes">New recovery codes</button>
+            <button class="mini" id="totpDisableShow">Turn off</button>
+          </div>
+          <div id="totpDisableForm" style="display:none; margin-top:14px">
+            <label for="disPw">Password</label>
+            <input id="disPw" type="password" autocomplete="current-password" />
+            <label for="disCode">Current code</label>
+            <input id="disCode" type="text" inputmode="numeric" maxlength="6" placeholder="000000" />
+            <button class="primary" id="totpDisable">Turn off two-factor</button>
+          </div>
+          <div id="newCodesForm" style="display:none; margin-top:14px">
+            <label for="codesPw">Password</label>
+            <input id="codesPw" type="password" autocomplete="current-password" />
+            <button class="primary" id="codesConfirm">Replace my recovery codes</button>
+          </div>
+        </div>
+
+        <div id="backupWrap" style="display:none; margin-top:18px">
+          <p class="muted">
+            <b>Save these recovery codes now.</b> Each one signs you in once if you lose
+            your phone. They are shown only here, only this once, and generating a new
+            set makes every earlier code stop working.
+          </p>
+          <div class="codes" id="backupCodes"></div>
+        </div>
+
+        <div class="error-text" id="totpError"></div>
+        <div class="ok-text" id="totpOkText"></div>
+      </section>
 
     </div>
   </div>
@@ -97,6 +302,7 @@
   // to hold, so nothing sensitive is reachable from this page's JavaScript.
   const OPTS = { credentials: 'same-origin' };
   const JSON_OPTS = { ...OPTS, headers: { 'Content-Type': 'application/json' } };
+  const API = '/__access/api/admin';
 
   // `expired` is only truthful once the console has actually loaded with a
   // working session. On a first visit there was never a session to expire,
@@ -116,11 +322,18 @@
     return res;
   }
 
-  function showError(msg) {
-    const err = $('errorText');
-    err.textContent = msg;
-    err.classList.add('show');
+  const post = (path, body) => api(path, {
+    ...JSON_OPTS,
+    method: 'POST',
+    body: JSON.stringify(body || {}),
+  });
+
+  function setMessage(id, text, show = true) {
+    const el = $(id);
+    el.textContent = text;
+    el.classList.toggle('show', show && Boolean(text));
   }
+  const showError = (msg) => setMessage('errorText', msg);
 
   function fmtDate(iso) {
     if (!iso) return '—';
@@ -131,14 +344,42 @@
 
   const BADGE = { PENDING: 'pending', ACTIVE: 'active', EXPIRED: 'error', REVOKED: 'error' };
 
-  // Filled in from /auth/me, so the console never offers a duration the
-  // server would reject and can state the link's own deadline.
-  let limits = { maxDurationHours: null, pendingExpiryHours: null };
+  function hoursLabel(h) { return h + (h === 1 ? ' hour' : ' hours'); }
 
+  // Everything the server told us about this session: the limits the console
+  // must not exceed, and the role that decides which controls exist at all.
+  let me = {};
+  const can = (...roles) => roles.includes(me.role);
+
+  // ------------------------------------------------------------------
+  // Tabs
+  // ------------------------------------------------------------------
+  const PANELS = ['access', 'audit', 'team', 'security'];
+  const loadedOnce = new Set();
+
+  function showTab(name) {
+    for (const panel of PANELS) $('panel-' + panel).hidden = panel !== name;
+    for (const tab of document.querySelectorAll('.tab')) {
+      tab.classList.toggle('on', tab.dataset.panel === name);
+    }
+    // Panels fetch on first view rather than at load. The audit log and the
+    // admin list are two more round trips that most visits to this console --
+    // which exist to issue one grant -- never need.
+    if (loadedOnce.has(name)) return;
+    loadedOnce.add(name);
+    if (name === 'audit') loadAudit();
+    if (name === 'team') loadTeam();
+  }
+
+  for (const tab of document.querySelectorAll('.tab')) {
+    tab.addEventListener('click', () => showTab(tab.dataset.panel));
+  }
+
+  // ==================================================================
+  // Access
+  // ==================================================================
   // The live grant currently standing in the way, if any.
   let collidingGrant = null;
-
-  function hoursLabel(h) { return h + (h === 1 ? ' hour' : ' hours'); }
 
   function showCollision(grant, title) {
     collidingGrant = grant;
@@ -167,7 +408,7 @@
     const seq = ++lookupSeq;
     if (!email) return hideCollision();
     try {
-      const res = await api('/__access/api/admin/grants/live?email=' + encodeURIComponent(email));
+      const res = await api(API + '/grants/live?email=' + encodeURIComponent(email));
       if (seq !== lookupSeq) return;
       if (!res.ok) return hideCollision();
       const { grant } = await res.json();
@@ -190,9 +431,33 @@
     row.scrollIntoView({ block: 'center', behavior: 'smooth' });
   }
 
+  const td = (text, cls) => {
+    const el = document.createElement('td');
+    el.textContent = text;
+    if (cls) el.className = cls;
+    return el;
+  };
+
+  function button(label, cls, onClick, title) {
+    const btn = document.createElement('button');
+    btn.className = 'mini ' + cls;
+    btn.textContent = label;
+    if (title) btn.title = title;
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  function grantQuery() {
+    const params = new URLSearchParams();
+    if ($('filterStatus').value) params.set('status', $('filterStatus').value);
+    if ($('filterEmail').value.trim()) params.set('email', $('filterEmail').value.trim());
+    const qs = params.toString();
+    return API + '/grants' + (qs ? '?' + qs : '');
+  }
+
   async function loadGrants() {
     try {
-      const res = await api('/__access/api/admin/grants');
+      const res = await api(grantQuery());
       if (!res.ok) { $('listHint').textContent = 'Could not load grants.'; return; }
 
       const { grants } = await res.json();
@@ -200,7 +465,7 @@
       body.textContent = '';
 
       if (!grants.length) {
-        $('listHint').textContent = 'No grants yet.';
+        $('listHint').textContent = 'Nothing matches that filter.';
         $('grantsTable').style.display = 'none';
         return;
       }
@@ -208,46 +473,66 @@
       $('listHint').textContent = '';
       $('grantsTable').style.display = 'table';
 
-      const td = (text, cls) => {
-        const el = document.createElement('td');
-        el.textContent = text;
-        if (cls) el.className = cls;
-        return el;
-      };
-
       for (const g of grants) {
         const tr = document.createElement('tr');
         tr.dataset.grantId = g.id;
-        tr.appendChild(td(g.email, 'mono'));
+
+        const emailTd = td(g.email, 'mono');
+        // Who issued it, and how many times the credentials have been re-sent.
+        // Both belong to the row rather than to a separate view, and neither
+        // earns a column of its own on a table this wide.
+        if (g.created_by_email) emailTd.title = 'Issued by ' + g.created_by_email;
+        tr.appendChild(emailTd);
 
         const statusTd = document.createElement('td');
         const badge = document.createElement('span');
         badge.className = 'badge ' + (BADGE[g.status] || 'pending');
         badge.textContent = g.status;
         statusTd.appendChild(badge);
+        if (g.resend_count > 0) {
+          // A compact marker rather than a phrase: this shares a narrow column
+          // with the status badge, and "1 re-sent" wraps mid-word there. The
+          // sentence lives in the tooltip, where there is room for it.
+          const resent = document.createElement('span');
+          resent.className = 'muted nowrap';
+          resent.textContent = ' ×' + g.resend_count;
+          resent.title = 'Credentials re-sent ' + g.resend_count
+            + (g.resend_count === 1 ? ' time' : ' times')
+            + '. Repeated re-sends can mean a delivery problem — or someone '
+            + 'working an admin over the phone.';
+          statusTd.appendChild(resent);
+        }
         tr.appendChild(statusTd);
 
         tr.appendChild(td(fmtDate(g.activated_at), 'mono'));
-        tr.appendChild(td(fmtDate(g.expires_at), 'mono'));
+
+        const expiresTd = td(fmtDate(g.expires_at), 'mono');
+        if (g.extended_seconds > 0) {
+          expiresTd.title = 'Extended by ' + hoursLabel(g.extended_seconds / 3600)
+            + ' beyond the original ' + hoursLabel(g.duration_seconds / 3600) + '.';
+        }
+        tr.appendChild(expiresTd);
+
+        tr.appendChild(td(g.reason || '—', 'detail'));
 
         const actionTd = document.createElement('td');
-        if (g.status === 'PENDING' || g.status === 'ACTIVE') {
-          const btn = document.createElement('button');
-          btn.className = 'mini';
-          btn.textContent = 'Revoke';
-          btn.addEventListener('click', () => revoke(g.id, btn));
-          actionTd.appendChild(btn);
+        // Auditors see the same rows and none of the buttons. The server
+        // refuses them either way -- this only avoids offering an action that
+        // is going to come back as a 403.
+        if ((g.status === 'PENDING' || g.status === 'ACTIVE') && can('owner', 'admin')) {
+          actionTd.appendChild(button('Revoke', '', (e) => revoke(g.id, e.target)));
+          actionTd.appendChild(button('Extend', 'go', () => showExtend(g, actionTd),
+            'Add time without disturbing the session in progress'));
 
-          // The provider accepting a message is not delivery, so a customer
-          // can be sitting on a link that never arrived. There is deliberately
-          // no stored plaintext password to re-send, so the answer is a new
-          // grant: revoke this one and issue another.
-          const again = document.createElement('button');
-          again.className = 'mini neutral';
-          again.textContent = 'Reissue';
-          again.title = 'Revoke this grant and issue a new one to the same address';
-          again.addEventListener('click', () => startReissue(g));
-          actionTd.appendChild(again);
+          if (g.status === 'PENDING') {
+            // Only for a link nobody has opened. Re-sending rotates both
+            // secrets, which would end an active customer's session.
+            actionTd.appendChild(button('Re-send', 'go', (e) => resend(g.id, e.target),
+              'New link and password to the same address'));
+          }
+
+          actionTd.appendChild(button('Reissue', 'neutral', () => startReissue(g),
+            'Revoke this grant and issue a new one to the same address'));
         }
         tr.appendChild(actionTd);
         body.appendChild(tr);
@@ -257,13 +542,16 @@
     }
   }
 
+  $('filterStatus').addEventListener('change', loadGrants);
+  $('filterEmail').addEventListener('change', loadGrants);
+
   // No confirm() here: a browser modal blocks the page, and the action is
   // cheap to redo by issuing a fresh grant.
   async function revoke(id, btn) {
     btn.disabled = true;
     btn.textContent = 'Revoking...';
     try {
-      const res = await api('/__access/api/admin/grants/' + id + '/revoke', { ...JSON_OPTS, method: 'POST' });
+      const res = await post(API + '/grants/' + id + '/revoke');
       if (!res.ok) {
         btn.disabled = false;
         btn.textContent = 'Revoke';
@@ -275,6 +563,87 @@
       if (e.message === 'unauthenticated') return;
       btn.disabled = false;
       btn.textContent = 'Revoke';
+      showError('Could not reach the server.');
+    }
+  }
+
+  // Extending asks for a number, so it replaces the row's action cell with a
+  // small inline form rather than opening prompt(). A native prompt blocks the
+  // whole page and cannot show the ceiling the server will enforce.
+  function showExtend(grant, cell) {
+    const previous = [...cell.childNodes];
+    cell.textContent = '';
+
+    const select = document.createElement('select');
+    select.style.width = 'auto';
+    select.style.display = 'inline-block';
+    for (const hours of [1, 2, 4, 8, 24]) {
+      const used = (grant.duration_seconds + grant.extended_seconds) / 3600;
+      if (me.maxDurationHours && used + hours > me.maxDurationHours) continue;
+      const opt = document.createElement('option');
+      opt.value = String(hours);
+      opt.textContent = '+' + hoursLabel(hours);
+      select.appendChild(opt);
+    }
+
+    const restore = () => {
+      cell.textContent = '';
+      for (const node of previous) cell.appendChild(node);
+    };
+
+    if (!select.options.length) {
+      cell.appendChild(document.createTextNode('At the ceiling '));
+      cell.appendChild(button('Back', 'neutral', restore));
+      return;
+    }
+
+    cell.appendChild(select);
+    cell.appendChild(button('Add', 'go', async (e) => {
+      e.target.disabled = true;
+      try {
+        const res = await post(API + '/grants/' + grant.id + '/extend',
+          { addHours: Number(select.value) });
+        const data = await res.json();
+        if (!res.ok) { showError(data.error || 'Could not extend.'); restore(); return; }
+        await loadGrants();
+        highlightGrant(grant.id);
+      } catch (err) {
+        if (err.message !== 'unauthenticated') { showError('Could not reach the server.'); restore(); }
+      }
+    }));
+    cell.appendChild(button('Cancel', 'neutral', restore));
+  }
+
+  async function resend(id, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Sending...';
+    try {
+      const res = await post(API + '/grants/' + id + '/resend', { relay: true });
+      const data = await res.json();
+      if (!res.ok && res.status !== 202) {
+        showError(data.error || 'Could not re-send.');
+        btn.disabled = false;
+        btn.textContent = 'Re-send';
+        return;
+      }
+      // The password comes back because relay was asked for: the usual reason
+      // to re-send is that the last message was accepted and never arrived, so
+      // the admin needs something to read out if this one does the same.
+      $('resultWrap').style.display = 'block';
+      $('rEmail').textContent = data.grant.email;
+      $('rUrl').textContent = data.accessUrl;
+      $('rStatus').textContent = data.warning ? 'Rotated, email failed' : 'Re-sent';
+      if (data.password) {
+        $('rPasswordNote').textContent = 'New password. The previous one no longer works.';
+        $('rPasswordWrap').style.display = 'block';
+        $('rPassword').textContent = data.password;
+      }
+      $('resultWrap').scrollIntoView({ block: 'center', behavior: 'smooth' });
+      await loadGrants();
+    } catch (e) {
+      if (e.message === 'unauthenticated') return;
+      btn.disabled = false;
+      btn.textContent = 'Re-send';
       showError('Could not reach the server.');
     }
   }
@@ -292,17 +661,14 @@
     btn.textContent = 'Sending...';
 
     try {
-      const res = await api('/__access/api/admin/grants', {
-        ...JSON_OPTS,
-        method: 'POST',
-        body: JSON.stringify({
-          email: $('email').value.trim(),
-          durationHours: Number($('duration').value),
-          // Asks for the password back so the admin can read it out. Only set
-          // on reissue, where the reason for reissuing is usually that the
-          // last email was accepted and never arrived.
-          relay,
-        }),
+      const res = await post(API + '/grants', {
+        email: $('email').value.trim(),
+        durationHours: Number($('duration').value),
+        reason: $('reason').value.trim(),
+        // Asks for the password back so the admin can read it out. Only set
+        // on reissue, where the reason for reissuing is usually that the
+        // last email was accepted and never arrived.
+        relay,
       });
       const data = await res.json();
       btn.disabled = false;
@@ -339,12 +705,13 @@
           ? 'The email did not send. Relay this password to the customer yourself'
             + ' — it is shown once and is not recoverable.'
           : 'Read this password to the customer yourself. It is shown once and is'
-            + ' not recoverable; if it is lost, reissue again.';
+            + ' not recoverable; if it is lost, re-send from the row below.';
         $('rPasswordWrap').style.display = 'block';
         $('rPassword').textContent = data.password;
       }
 
       $('email').value = '';
+      $('reason').value = '';
       await loadGrants();
       return true;
     } catch (e) {
@@ -364,10 +731,11 @@
   $('email').addEventListener('input', () => { if (collidingGrant) hideCollision(); });
 
   // Loads the form from an existing grant and asks for confirmation. Used by
-  // the Reissue button on a live row -- most often because the customer never
-  // received the email, which the provider's "accepted" tells us nothing about.
+  // the Reissue button on a live row, where the customer needs a clean start
+  // rather than more time on the grant they have.
   function startReissue(grant) {
     $('email').value = grant.email;
+    if (grant.reason) $('reason').value = grant.reason;
     const hours = Math.round((grant.duration_seconds || 3600) / 3600);
     if (![...$('duration').options].some((o) => Number(o.value) === hours)) {
       const opt = document.createElement('option');
@@ -390,10 +758,7 @@
     btn.textContent = 'Revoking...';
 
     try {
-      const res = await api('/__access/api/admin/grants/' + collidingGrant.id + '/revoke', {
-        ...JSON_OPTS,
-        method: 'POST',
-      });
+      const res = await post(API + '/grants/' + collidingGrant.id + '/revoke');
       btn.disabled = false;
       btn.textContent = 'Revoke and reissue';
       if (!res.ok) {
@@ -412,20 +777,345 @@
 
   $('collisionDismiss').addEventListener('click', hideCollision);
 
+  // ==================================================================
+  // Audit log
+  // ==================================================================
+  function auditParams() {
+    const params = new URLSearchParams();
+    if ($('aEvent').value.trim()) params.set('event', $('aEvent').value.trim());
+    if ($('aActor').value.trim()) params.set('actor', $('aActor').value.trim());
+    // A date input gives a bare day. `to` is pushed to the end of that day, or
+    // "from the 1st to the 1st" returns the single instant at midnight and
+    // looks like an empty log.
+    if ($('aFrom').value) params.set('from', new Date($('aFrom').value + 'T00:00:00').toISOString());
+    if ($('aTo').value) params.set('to', new Date($('aTo').value + 'T23:59:59.999').toISOString());
+    return params;
+  }
+
+  async function loadAudit() {
+    $('aHint').textContent = 'Loading…';
+    try {
+      const res = await api(API + '/audit-log?' + auditParams().toString());
+      const data = await res.json();
+      if (!res.ok) { $('aHint').textContent = data.error || 'Could not load the log.'; return; }
+
+      const body = $('auditBody');
+      body.textContent = '';
+      if (!data.events.length) {
+        $('aHint').textContent = 'Nothing matches that filter.';
+        $('auditTable').style.display = 'none';
+        return;
+      }
+      $('aHint').textContent = data.events.length + ' event'
+        + (data.events.length === 1 ? '' : 's') + ', newest first.';
+      $('auditTable').style.display = 'table';
+
+      for (const e of data.events) {
+        const tr = document.createElement('tr');
+        tr.appendChild(td(fmtDate(e.created_at), 'mono'));
+        tr.appendChild(td(e.event, 'mono'));
+        tr.appendChild(td(e.actor || '—', 'mono'));
+        tr.appendChild(td(e.ip_address || '—', 'mono'));
+        tr.appendChild(td(e.detail ? JSON.stringify(e.detail) : '—', 'detail'));
+        body.appendChild(tr);
+      }
+    } catch (err) {
+      if (err.message !== 'unauthenticated') $('aHint').textContent = 'Could not reach the server.';
+    }
+  }
+
+  $('aLoad').addEventListener('click', loadAudit);
+  $('aClear').addEventListener('click', () => {
+    for (const id of ['aEvent', 'aActor', 'aFrom', 'aTo']) $(id).value = '';
+    loadAudit();
+  });
+  // A plain navigation, because the response carries Content-Disposition:
+  // attachment and the browser saves it without leaving the console.
+  $('aExport').addEventListener('click', () => {
+    window.location = API + '/audit-log.csv?' + auditParams().toString();
+  });
+
+  // ==================================================================
+  // Team
+  // ==================================================================
+  async function loadTeam() {
+    try {
+      const res = await api(API + '/admins');
+      if (!res.ok) { $('teamHint').textContent = 'Could not load the admin list.'; return; }
+      const { admins } = await res.json();
+
+      const body = $('teamBody');
+      body.textContent = '';
+      $('teamHint').textContent = '';
+      $('teamTable').style.display = 'table';
+
+      for (const a of admins) {
+        const tr = document.createElement('tr');
+        const emailTd = td(a.email, 'mono');
+        if (a.disabled_at) emailTd.textContent = a.email + ' (disabled)';
+        tr.appendChild(emailTd);
+
+        const roleTd = document.createElement('td');
+        if (can('owner') && !a.disabled_at) {
+          // The server refuses a change that would leave no owner; this is
+          // just the control, and it reverts if the server says no.
+          const select = document.createElement('select');
+          select.style.width = 'auto';
+          for (const role of ['owner', 'admin', 'auditor']) {
+            const opt = document.createElement('option');
+            opt.value = role;
+            opt.textContent = role;
+            opt.selected = role === a.role;
+            select.appendChild(opt);
+          }
+          select.addEventListener('change', async () => {
+            setMessage('teamError', '', false);
+            try {
+              const r = await post(API + '/admins/' + a.id + '/role', { role: select.value });
+              const d = await r.json();
+              if (!r.ok) { setMessage('teamError', d.error || 'Could not change the role.'); select.value = a.role; return; }
+              await loadTeam();
+            } catch (err) {
+              if (err.message !== 'unauthenticated') {
+                setMessage('teamError', 'Could not reach the server.');
+                select.value = a.role;
+              }
+            }
+          });
+          roleTd.appendChild(select);
+        } else {
+          const badge = document.createElement('span');
+          badge.className = 'badge role';
+          badge.textContent = a.role;
+          roleTd.appendChild(badge);
+        }
+        tr.appendChild(roleTd);
+
+        tr.appendChild(td(a.totp_enabled ? 'On' : 'Off', a.totp_enabled ? '' : 'muted'));
+        tr.appendChild(td(fmtDate(a.last_login_at), 'mono'));
+
+        const actionTd = document.createElement('td');
+        if (can('owner') && a.email !== me.email) {
+          const disabled = Boolean(a.disabled_at);
+          actionTd.appendChild(button(
+            disabled ? 'Enable' : 'Disable',
+            disabled ? 'go' : '',
+            async (e) => {
+              e.target.disabled = true;
+              setMessage('teamError', '', false);
+              try {
+                const r = await post(API + '/admins/' + a.id + (disabled ? '/enable' : '/disable'));
+                const d = await r.json();
+                if (!r.ok) { setMessage('teamError', d.error || 'Could not change the account.'); e.target.disabled = false; return; }
+                await loadTeam();
+              } catch (err) {
+                if (err.message !== 'unauthenticated') {
+                  setMessage('teamError', 'Could not reach the server.');
+                  e.target.disabled = false;
+                }
+              }
+            },
+            disabled ? 'Let this person sign in again'
+              : 'Ends their session on their very next request'
+          ));
+        }
+        tr.appendChild(actionTd);
+        body.appendChild(tr);
+      }
+    } catch (e) {
+      if (e.message !== 'unauthenticated') $('teamHint').textContent = 'Could not reach the server.';
+    }
+  }
+
+  $('newAdminSubmit').addEventListener('click', async () => {
+    const btn = $('newAdminSubmit');
+    setMessage('teamError', '', false);
+    $('newAdminResult').style.display = 'none';
+    btn.disabled = true;
+    btn.textContent = 'Creating...';
+    try {
+      const res = await post(API + '/admins', {
+        email: $('newAdminEmail').value.trim(),
+        role: $('newAdminRole').value,
+      });
+      const data = await res.json();
+      btn.disabled = false;
+      btn.textContent = 'Create account';
+      if (!res.ok) { setMessage('teamError', data.error || 'Could not create the account.'); return; }
+
+      $('newAdminWho').textContent = data.admin.email;
+      $('newAdminPassword').textContent = data.temporaryPassword;
+      $('newAdminResult').style.display = 'block';
+      $('newAdminEmail').value = '';
+      await loadTeam();
+    } catch (e) {
+      if (e.message === 'unauthenticated') return;
+      btn.disabled = false;
+      btn.textContent = 'Create account';
+      setMessage('teamError', 'Could not reach the server.');
+    }
+  });
+
+  // ==================================================================
+  // Security
+  // ==================================================================
+  $('pwSubmit').addEventListener('click', async () => {
+    setMessage('pwError', '', false);
+    setMessage('pwOk', '', false);
+    if ($('newPw').value !== $('newPw2').value) {
+      return setMessage('pwError', 'The two new passwords do not match.');
+    }
+    const btn = $('pwSubmit');
+    btn.disabled = true;
+    try {
+      const res = await post(API + '/auth/password', {
+        currentPassword: $('curPw').value,
+        newPassword: $('newPw').value,
+      });
+      const data = await res.json();
+      btn.disabled = false;
+      if (!res.ok) return setMessage('pwError', data.error || 'Could not update the password.');
+
+      for (const id of ['curPw', 'newPw', 'newPw2']) $(id).value = '';
+      setMessage('pwOk', 'Password updated.');
+      // Clearing the forced state without a reload would leave the tabs hidden
+      // and the console unusable; this is the one place a reload is right.
+      if (me.mustChangePassword) window.location.reload();
+    } catch (e) {
+      btn.disabled = false;
+      if (e.message !== 'unauthenticated') setMessage('pwError', 'Could not reach the server.');
+    }
+  });
+
+  function showBackupCodes(codes) {
+    const wrap = $('backupCodes');
+    wrap.textContent = '';
+    for (const code of codes) {
+      const el = document.createElement('span');
+      el.textContent = code;
+      wrap.appendChild(el);
+    }
+    $('backupWrap').style.display = 'block';
+    $('backupWrap').scrollIntoView({ block: 'center', behavior: 'smooth' });
+  }
+
+  function paintTotp() {
+    $('totpState').textContent = me.totpEnabled
+      ? 'On. Sign-in asks for a code from your authenticator app.'
+      : (me.totpRequired
+        ? 'Required by this deployment. You cannot use the console until it is on.'
+        : 'Off. Your password alone can mint access to the internal network.');
+    $('totpOff').style.display = me.totpEnabled ? 'none' : 'block';
+    $('totpOn').style.display = me.totpEnabled ? 'block' : 'none';
+    // Turning it off is not offered at all when the deployment requires it --
+    // the server refuses, and a button that always fails is noise.
+    $('totpDisableShow').hidden = Boolean(me.totpRequired);
+  }
+
+  $('totpStart').addEventListener('click', async () => {
+    setMessage('totpError', '', false);
+    try {
+      const res = await post(API + '/auth/totp/setup');
+      const data = await res.json();
+      if (!res.ok) return setMessage('totpError', data.error || 'Could not start enrolment.');
+      $('totpSecret').textContent = data.secret;
+      $('totpUri').textContent = data.otpauthUri;
+      $('totpEnrol').style.display = 'block';
+      $('totpCode').focus();
+    } catch (e) {
+      if (e.message !== 'unauthenticated') setMessage('totpError', 'Could not reach the server.');
+    }
+  });
+
+  $('totpEnable').addEventListener('click', async () => {
+    setMessage('totpError', '', false);
+    setMessage('totpOkText', '', false);
+    const btn = $('totpEnable');
+    btn.disabled = true;
+    try {
+      const res = await post(API + '/auth/totp/enable', { code: $('totpCode').value.trim() });
+      const data = await res.json();
+      btn.disabled = false;
+      if (!res.ok) return setMessage('totpError', data.error || 'Could not turn on two-factor.');
+
+      me.totpEnabled = true;
+      $('totpEnrol').style.display = 'none';
+      $('totpCode').value = '';
+      paintTotp();
+      setMessage('totpOkText', 'Two-factor is on.');
+      showBackupCodes(data.backupCodes);
+      // The tabs were hidden while enrolment was outstanding; they are earned
+      // now, and a reload is the honest way to re-ask the server what this
+      // account may do.
+      if (me.totpRequired) setTimeout(() => { $('forcedDetail').textContent =
+        'Two-factor is on. Save the codes above, then reload to use the console.'; }, 0);
+    } catch (e) {
+      btn.disabled = false;
+      if (e.message !== 'unauthenticated') setMessage('totpError', 'Could not reach the server.');
+    }
+  });
+
+  $('totpDisableShow').addEventListener('click', () => {
+    $('totpDisableForm').style.display = 'block';
+    $('newCodesForm').style.display = 'none';
+  });
+  $('totpNewCodes').addEventListener('click', () => {
+    $('newCodesForm').style.display = 'block';
+    $('totpDisableForm').style.display = 'none';
+  });
+
+  $('totpDisable').addEventListener('click', async () => {
+    setMessage('totpError', '', false);
+    try {
+      const res = await post(API + '/auth/totp/disable', {
+        password: $('disPw').value,
+        code: $('disCode').value.trim(),
+      });
+      const data = await res.json();
+      if (!res.ok) return setMessage('totpError', data.error || 'Could not turn off two-factor.');
+      me.totpEnabled = false;
+      $('disPw').value = '';
+      $('disCode').value = '';
+      $('totpDisableForm').style.display = 'none';
+      $('backupWrap').style.display = 'none';
+      paintTotp();
+      setMessage('totpOkText', 'Two-factor is off.');
+    } catch (e) {
+      if (e.message !== 'unauthenticated') setMessage('totpError', 'Could not reach the server.');
+    }
+  });
+
+  $('codesConfirm').addEventListener('click', async () => {
+    setMessage('totpError', '', false);
+    try {
+      const res = await post(API + '/auth/totp/backup-codes', { password: $('codesPw').value });
+      const data = await res.json();
+      if (!res.ok) return setMessage('totpError', data.error || 'Could not issue new codes.');
+      $('codesPw').value = '';
+      $('newCodesForm').style.display = 'none';
+      setMessage('totpOkText', 'New recovery codes. Every earlier code has stopped working.');
+      showBackupCodes(data.backupCodes);
+    } catch (e) {
+      if (e.message !== 'unauthenticated') setMessage('totpError', 'Could not reach the server.');
+    }
+  });
+
   $('signOut').addEventListener('click', async () => {
     try {
-      await fetch('/__access/api/admin/auth/logout', { ...JSON_OPTS, method: 'POST' });
+      await fetch(API + '/auth/logout', { ...JSON_OPTS, method: 'POST' });
     } catch (e) {
       // The cookie is dead server-side either way; the server decides.
     }
     window.location.href = '/__access/admin-login';
   });
 
+  // ==================================================================
+  // Boot
+  // ==================================================================
   // The console should never offer a duration the server will reject, and it
   // should be able to state the link's own deadline -- both come from the
   // server rather than being duplicated as constants here.
-  function applyLimits(me) {
-    limits = me;
+  function applyLimits() {
     if (me.maxDurationHours) {
       for (const opt of [...$('duration').options]) {
         if (Number(opt.value) > me.maxDurationHours) opt.remove();
@@ -443,19 +1133,63 @@
         + hoursLabel(me.pendingExpiryHours)
         + '. The access window above starts when they open it, not now.';
     }
+    if (me.requireGrantReason) {
+      $('reasonLabel').textContent = 'Reason';
+      $('reason').required = true;
+    }
+  }
+
+  // Two states in which the server will refuse everything else. The console
+  // shows only the way out of them -- and the server enforces it regardless,
+  // so this is presentation, not the control.
+  function applyForcedState() {
+    const needsPassword = me.mustChangePassword;
+    const needsTotp = me.totpRequired && !me.totpEnabled;
+    if (!needsPassword && !needsTotp) return false;
+
+    $('forced').style.display = 'block';
+    $('forcedTitle').textContent = needsPassword
+      ? 'Choose your own password before continuing.'
+      : 'Two-factor authentication is required here.';
+    $('forcedDetail').textContent = needsPassword
+      ? 'This account is using a password someone else generated for it. The rest of '
+        + 'the console is unavailable until you change it.'
+      : 'Enrol an authenticator app below. The rest of the console is unavailable '
+        + 'until you do.';
+
+    $('tabs').hidden = true;
+    showTab('security');
+    // Password first when both are outstanding: enrolling a second factor
+    // against a credential a colleague still knows secures very little.
+    if (needsPassword) $('totpState').textContent = 'Change your password first.';
+    return true;
   }
 
   // Establish who we are before showing anything, so an unauthenticated
   // visitor never sees the console chrome at all.
   (async () => {
     try {
-      const res = await api('/__access/api/admin/auth/me');
+      const res = await api(API + '/auth/me');
       if (!res.ok) return toLogin();
-      const me = await res.json();
+      me = await res.json();
+
       $('whoEmail').textContent = me.email;
-      applyLimits(me);
+      $('whoRole').textContent = me.role;
+      $('tabTeam').hidden = !can('owner', 'admin');
+      $('teamCreate').hidden = !can('owner');
+      // Auditors read; they do not issue. The server enforces this on the
+      // route, and hiding the form keeps the console honest about it.
+      $('issueForm').hidden = !can('owner', 'admin');
+
+      applyLimits();
       $('shell').style.display = 'block';
       consoleLoaded = true;
+
+      if (applyForcedState()) {
+        paintTotp();
+        return;
+      }
+      paintTotp();
       await loadGrants();
     } catch (e) {
       if (e.message !== 'unauthenticated') {
