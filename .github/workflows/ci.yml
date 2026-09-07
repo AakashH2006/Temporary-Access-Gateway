@@ -1,0 +1,79 @@
+# The integration tests skip themselves when TEST_DATABASE_URL is absent, so a
+# run without a database is green and proves almost nothing. Providing Postgres
+# here is the point of this file: the tests that matter -- revocation, expiry,
+# lockouts, the one-live-grant-per-email index -- are all database behaviour.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: temp_access_test
+        ports:
+          - 5432:5432
+        # Without this the first step can run before Postgres accepts
+        # connections, and the failure looks like a broken test rather than a
+        # race in the workflow.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/temp_access_test
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/temp_access_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Apply the schema
+        run: npm run migrate
+
+      # Re-running it is not busywork: schema.sql is written to be applied to
+      # an existing database, and every deployment after the first one does
+      # exactly this. A migration that only works on an empty database is a
+      # failed deploy discovered in production.
+      - name: Apply the schema again (it must be re-runnable)
+        run: npm run migrate
+
+      - run: npm test
+
+  # A demo that does not build is not a demo. This catches the image breaking
+  # without waiting for someone to try `docker compose up` in front of a
+  # client.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build
+      - name: The stack comes up healthy
+        run: |
+          docker compose up -d --wait --wait-timeout 120
+          docker compose ps
+          curl -fsS localhost:3000/__access/health
+          # The upstream refuses a request that did not come through the
+          # gateway. If this ever answers 200, the isolation is gone.
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:4001/)" = "403"
+      - if: always()
+        run: docker compose logs
+      - if: always()
+        run: docker compose down -v

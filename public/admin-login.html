@@ -15,18 +15,41 @@
     <div class="perf"></div>
     <div class="ticket-body">
       <p class="muted" id="hint">
-        Admin accounts are created on the server with
-        <code>npm run create-admin</code>.
+        The first admin account is created on the server with
+        <code>npm run create-admin</code>. After that, an owner adds people from
+        the console.
       </p>
 
       <form id="form">
-        <label for="email">Email</label>
-        <input id="email" type="email" autocomplete="username" required />
+        <div id="credentials">
+          <label for="email">Email</label>
+          <input id="email" type="email" autocomplete="username" required />
 
-        <label for="password">Password</label>
-        <input id="password" type="password" autocomplete="current-password" required />
+          <label for="password">Password</label>
+          <input id="password" type="password" autocomplete="current-password" required />
+        </div>
+
+        <!-- Revealed only once the server has said this account has a second
+             factor. Asking every admin for a code they may not have is how a
+             sign-in page teaches people to ignore a field. -->
+        <div id="secondFactor" hidden>
+          <p class="muted" id="factorHint">
+            Enter the six-digit code from your authenticator app.
+          </p>
+          <label for="totpCode">Authentication code</label>
+          <input id="totpCode" type="text" inputmode="numeric" autocomplete="one-time-code"
+                 maxlength="6" placeholder="000000" />
+
+          <div id="recoveryWrap" hidden>
+            <label for="backupCode">Recovery code</label>
+            <input id="backupCode" type="text" autocomplete="off" placeholder="XXXXX-XXXXX" />
+          </div>
+        </div>
 
         <button class="primary" id="submitBtn" type="submit">Sign in</button>
+        <button class="ghost" id="useRecovery" type="button" hidden>
+          Lost your phone? Use a recovery code
+        </button>
       </form>
       <div class="error-text" id="errorText"></div>
     </div>
@@ -39,6 +62,20 @@
     $('hint').textContent = 'Your admin session expired. Sign in again.';
   }
 
+  // Set once the server has answered `totp_required`. Until then the code
+  // fields are not sent at all, so an account without a second factor signs in
+  // in one step exactly as before.
+  let awaitingCode = false;
+
+  $('useRecovery').addEventListener('click', () => {
+    $('recoveryWrap').hidden = false;
+    $('useRecovery').hidden = true;
+    $('factorHint').textContent =
+      'Enter one of the recovery codes you saved when you turned on two-factor. '
+      + 'Each one works once.';
+    $('backupCode').focus();
+  });
+
   $('form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const btn = $('submitBtn');
@@ -47,6 +84,15 @@
     btn.disabled = true;
     btn.textContent = 'Signing in...';
 
+    const body = {
+      email: $('email').value.trim(),
+      password: $('password').value,
+    };
+    if (awaitingCode) {
+      if ($('backupCode').value.trim()) body.backupCode = $('backupCode').value.trim();
+      else body.totpCode = $('totpCode').value.trim();
+    }
+
     try {
       const res = await fetch('/__access/api/admin/auth/login', {
         method: 'POST',
@@ -54,14 +100,28 @@
         // The session arrives as an httpOnly cookie. Nothing is kept in
         // sessionStorage, so no credential is reachable from JavaScript.
         credentials: 'same-origin',
-        body: JSON.stringify({
-          email: $('email').value.trim(),
-          password: $('password').value,
-        }),
+        body: JSON.stringify(body),
       });
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
+
+        // The password was right and this account has a second factor. Reveal
+        // the code field rather than reporting a failure -- nothing has failed.
+        if (data.reason === 'totp_required') {
+          awaitingCode = true;
+          $('secondFactor').hidden = false;
+          $('useRecovery').hidden = false;
+          // The credentials are locked rather than hidden: a password manager
+          // needs them present, and an admin correcting a typo should start
+          // over rather than send a code against a different account.
+          for (const id of ['email', 'password']) $(id).readOnly = true;
+          $('totpCode').focus();
+          btn.disabled = false;
+          btn.textContent = 'Sign in';
+          return;
+        }
+
         // 429 is the rate limiter, which returns text rather than our JSON.
         err.textContent = res.status === 429
           ? 'Too many attempts. Wait a few minutes and try again.'
@@ -69,6 +129,13 @@
         err.classList.add('show');
         btn.disabled = false;
         btn.textContent = 'Sign in';
+        // A wrong code is a wrong code, not a wrong password: clear the six
+        // digits and leave everything else as it was.
+        if (awaitingCode) {
+          $('totpCode').value = '';
+          $('backupCode').value = '';
+          $('totpCode').focus();
+        }
         return;
       }
 

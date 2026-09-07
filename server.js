@@ -13,6 +13,12 @@ const { Pool } = require('pg');
 const ipaddr = require('ipaddr.js');
 const { createProxyMiddleware, responseInterceptor } = require('http-proxy-middleware');
 
+const { log } = require('./lib/logger');
+const metrics = require('./lib/metrics');
+const totp = require('./lib/totp');
+const webhooks = require('./lib/webhooks');
+const { version: SERVICE_VERSION } = require('./package.json');
+
 // ============================================================
 // Config
 // ============================================================
@@ -36,6 +42,11 @@ if (process.env.JWT_SECRET.length < 32) {
 // a single namespace is what makes that collision-free -- the app is free to
 // have its own /api, /login or /admin.
 const GATE = '/__access';
+
+// Mirrors the CHECK constraint on access_grants.status. Kept here so a filter
+// value from a query string is validated against the same list the database
+// enforces, rather than being interpolated and turning a typo into a 500.
+const GRANT_STATUSES = ['PENDING', 'ACTIVE', 'EXPIRED', 'REVOKED'];
 
 const PORT = Number(process.env.PORT || 3000);
 const UPSTREAM_URL = process.env.UPSTREAM_URL;
@@ -83,8 +94,38 @@ const GRANT_LOCKOUT_MINUTES = Number(process.env.GRANT_LOCKOUT_MINUTES || 15);
 const UPSTREAM_SHARED_SECRET = process.env.UPSTREAM_SHARED_SECRET || '';
 const UPSTREAM_SECRET_HEADER = process.env.UPSTREAM_SECRET_HEADER || 'X-Gateway-Secret';
 
+// Two policy switches, read at the point of use rather than captured at load
+// like the rest of the config above.
+//
+// The difference is deliberate and narrow: everything else here is a value the
+// gateway needs before it can serve a single request, and reading it once at
+// boot is what makes a missing one a refusal to start. These two only change
+// what an authenticated admin is asked for, so a stale copy has no failure mode
+// -- and reading them live is what lets the tests cover both settings without
+// standing up a second gateway to hold the other value.
+
+// Requires the admin to say why, on every grant. Off by default because it is
+// a policy question rather than a technical one -- but a company that will ever
+// be asked "who had access to this system in March, and on whose authority"
+// has to have the answer written down at the moment access is granted. There is
+// no reconstructing it afterwards.
+const requireGrantReason = () => process.env.REQUIRE_GRANT_REASON === 'true';
+const MAX_REASON_LENGTH = 500;
+
+// ---- observability ----
+// The metrics endpoint is not public. It publishes the shape of the traffic,
+// the number of live grants and the failure counts -- reconnaissance, in other
+// words, on the one door into the internal network. It is served only when a
+// token is configured, and compared in constant time.
+const METRICS_TOKEN = process.env.METRICS_TOKEN || '';
+
 // ---- admin ----
 const ADMIN_COOKIE_NAME = 'ta_admin';
+// Refuse to let an account without two-factor use the console. Off by default
+// so an existing deployment keeps working across the upgrade that added TOTP;
+// a company should turn it on, and the console walks each admin through
+// enrolment rather than locking them out (see requireEnrolled).
+const requireAdminTotp = () => process.env.ADMIN_REQUIRE_TOTP === 'true';
 const ADMIN_SESSION_TTL_SECONDS = Number(process.env.ADMIN_SESSION_TTL_SECONDS || 3600);
 const ADMIN_MAX_FAILED_ATTEMPTS = Number(process.env.ADMIN_MAX_FAILED_ATTEMPTS || 5);
 const ADMIN_LOCKOUT_MINUTES = Number(process.env.ADMIN_LOCKOUT_MINUTES || 15);
@@ -130,7 +171,7 @@ const pool = new Pool({
 // that turns a database blip the pool would have recovered from on the next
 // checkout into a total outage for everyone using the gateway.
 pool.on('error', (err) => {
-  console.error('idle client error:', err.message);
+  log.error('idle database client error', { err: err.message });
 });
 
 // ============================================================
@@ -371,17 +412,36 @@ async function sendAccessEmail({ to, ...message }) {
 // for a logging problem. `req` may be null for events raised by background
 // jobs, which have no request context.
 async function audit(req, { grantId = null, event, actor = null, detail = null }) {
+  const ip = req ? (req.ip || req.socket?.remoteAddress || null) : null;
+  const userAgent = req ? (req.header?.('User-Agent') || null) : null;
+  const requestId = req?.id || null;
+
   try {
-    const ip = req ? (req.ip || req.socket?.remoteAddress || null) : null;
-    const userAgent = req ? (req.header?.('User-Agent') || null) : null;
     await pool.query(
-      `INSERT INTO audit_log (grant_id, event, actor, ip_address, user_agent, detail)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [grantId, event, actor, ip, userAgent, detail ? JSON.stringify(detail) : null]
+      `INSERT INTO audit_log (grant_id, event, actor, ip_address, user_agent, detail, request_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [grantId, event, actor, ip, userAgent, detail ? JSON.stringify(detail) : null, requestId]
     );
   } catch (err) {
-    console.error('audit log write failed:', err.message);
+    log.error('audit log write failed', { event, err: err.message });
   }
+
+  // Same rule as the insert: a notification problem must never fail the flow
+  // that produced the event. `enqueue` swallows its own errors for that reason,
+  // and this is only awaited so the row is written inside the request rather
+  // than after the response, where an error would have nowhere to go.
+  await webhooks.enqueue(pool, event, {
+    grantId,
+    actor,
+    ip,
+    requestId,
+    ...(detail || {}),
+  });
+
+  // Also emitted to the process log. The audit table is the record of
+  // authorization decisions and is queried by a human after the fact; this is
+  // the line that shows up in a log search next to the request that caused it.
+  log.info('audit', { event, actor, grantId, requestId });
 }
 
 // ============================================================
@@ -575,7 +635,8 @@ async function requireAdminSession(req, res, next) {
   }
 
   const { rows } = await pool.query(
-    'SELECT id, email, disabled_at FROM admins WHERE id = $1',
+    `SELECT id, email, role, disabled_at, must_change_password, totp_enabled
+       FROM admins WHERE id = $1`,
     [payload.adminId]
   );
   const admin = rows[0];
@@ -584,12 +645,70 @@ async function requireAdminSession(req, res, next) {
     return res.status(401).json({ error: 'Admin account is no longer active' });
   }
 
-  req.admin = { id: admin.id, email: admin.email };
+  // The role is read from the row on every request, not taken from the token.
+  // A demotion has to take effect at once, for the same reason disabling an
+  // account does -- a role carried in a JWT stays true until the token expires,
+  // which is exactly the hour you did not want it to.
+  req.admin = {
+    id: admin.id,
+    email: admin.email,
+    role: admin.role,
+    mustChangePassword: admin.must_change_password,
+    totpEnabled: admin.totp_enabled,
+  };
   next();
 }
 
-// Applied to every admin route, in order: network first, then identity.
-const adminOnly = [adminIpAllowlist, requireAdminSession];
+// ------------------------------------------------------------------
+// Roles
+// ------------------------------------------------------------------
+// A capability check, not a role comparison. Handlers name what they need --
+// `requireRole('owner')` -- rather than testing `role !== 'auditor'`, because
+// the second form silently grants every future role that gets added.
+const ROLES = ['owner', 'admin', 'auditor'];
+
+function requireRole(...allowed) {
+  return (req, res, next) => {
+    if (allowed.includes(req.admin.role)) return next();
+    // 403 rather than 404 here, unlike the IP allowlist: this caller has
+    // already proved who they are, and hiding the route from them produces a
+    // support ticket about a broken console rather than an understood refusal.
+    return res.status(403).json({
+      error: 'Your account does not have permission to do this.',
+      requiredRole: allowed,
+      role: req.admin.role,
+    });
+  };
+}
+
+// Two states in which an authenticated admin is allowed to do nothing except
+// fix that state: a password that must be changed, and -- when the deployment
+// requires two-factor -- an account that has not enrolled.
+//
+// Enforced server-side rather than by the console hiding buttons. A console
+// that merely declines to show the form is a console, not a control.
+function requireEnrolled(req, res, next) {
+  if (req.admin.mustChangePassword) {
+    return res.status(403).json({
+      error: 'Change your password before using the console.',
+      reason: 'password_change_required',
+    });
+  }
+  if (requireAdminTotp() && !req.admin.totpEnabled) {
+    return res.status(403).json({
+      error: 'Two-factor authentication is required before using the console.',
+      reason: 'totp_enrolment_required',
+    });
+  }
+  next();
+}
+
+// Applied to every admin route, in order: network first, then identity, then
+// whether that identity is in a state allowed to do anything.
+const adminOnly = [adminIpAllowlist, requireAdminSession, requireEnrolled];
+// For the handful of routes that must stay reachable while an admin is in one
+// of those states -- changing the password, enrolling in TOTP, signing out.
+const adminAuthed = [adminIpAllowlist, requireAdminSession];
 
 async function requireSessionApi(req, res, next) {
   const result = await resolveSession(req);
@@ -611,6 +730,58 @@ const app = express();
 // audit log and evade per-IP rate limiting.
 if (process.env.TRUST_PROXY === 'true') app.set('trust proxy', 1);
 app.disable('x-powered-by');
+
+// ------------------------------------------------------------------
+// Request identity, access logging and metrics
+// ------------------------------------------------------------------
+// First in the chain, so that everything after it -- including the rate
+// limiters and the 404s -- is counted and correlated. A middleware that only
+// covers the handlers that succeeded measures the wrong population.
+const INBOUND_REQUEST_ID = /^[A-Za-z0-9_.-]{1,128}$/;
+
+app.use((req, res, next) => {
+  // An id from a load balancer or a calling service is reused so a trace does
+  // not break at this hop, but it is validated first: the value ends up in log
+  // lines and in a database column, and an unbounded header is how a log file
+  // acquires forged newlines and a JSON collector acquires a parse error.
+  const inbound = req.headers['x-request-id'];
+  req.id = INBOUND_REQUEST_ID.test(inbound || '') ? inbound : crypto.randomUUID();
+  req.log = log.child({ requestId: req.id });
+  // Echoed back so a customer reporting a failure can quote something that
+  // finds the exact request in the logs.
+  res.setHeader('X-Request-Id', req.id);
+
+  const startedAt = process.hrtime.bigint();
+  // 'finish' fires only on a completed response; 'close' also covers a client
+  // that hung up mid-transfer, which on a proxy is a normal and interesting
+  // event rather than an edge case.
+  res.once('close', () => {
+    const seconds = Number(process.hrtime.bigint() - startedAt) / 1e9;
+    const route = metrics.routePattern(req);
+    const labels = { route, method: req.method, status: metrics.statusClass(res.statusCode) };
+    metrics.counter('gateway_http_requests_total', labels);
+    metrics.observe('gateway_http_request_duration_seconds', { route }, seconds);
+
+    // Access lines are debug-level for the ordinary case: on a reverse proxy
+    // this fires for every image and stylesheet the upstream app pulls in, and
+    // at info level a single page load buries whatever else was happening.
+    // Server errors are always worth a line.
+    const level = res.statusCode >= 500 ? 'error' : 'debug';
+    req.log[level]('request', {
+      method: req.method,
+      // The gate's own paths are bounded and safe to log whole. Everything else
+      // belongs to the upstream app, whose URLs can carry anything a customer
+      // types -- so those are logged without the query string.
+      path: req.originalUrl.startsWith(GATE) ? req.originalUrl : req.path,
+      status: res.statusCode,
+      durationMs: Math.round(seconds * 1000),
+      ip: req.ip,
+    });
+  });
+
+  next();
+});
+
 app.use(cookieParser());
 
 // Body parsing is scoped to the gate's own API. Applying express.json()
@@ -691,7 +862,57 @@ app.get(`${GATE}/dashboard`, page('dashboard.html'));
 // cannot even discover that a console exists here.
 app.get(`${GATE}/admin`, adminIpAllowlist, page('admin.html'));
 app.get(`${GATE}/admin-login`, adminIpAllowlist, page('admin-login.html'));
-app.get(`${GATE}/health`, (_req, res) => res.json({ ok: true, upstream: UPSTREAM_URL }));
+// Unauthenticated, so it says as little as possible: it used to return
+// UPSTREAM_URL, which published the internal address of the app this whole
+// system exists to keep off the public internet, to anyone who asked.
+//
+// It reports the database because that is the dependency whose loss the
+// gateway cannot paper over -- no grant can be read, so nobody gets in --
+// and because a container orchestrator restarting on a 503 is the behaviour
+// you want. A process that is listening but cannot reach Postgres is not
+// healthy, and answering `{"ok":true}` from it delays every alarm.
+async function readiness(_req, res) {
+  try {
+    await pool.query('SELECT 1');
+  } catch (err) {
+    log.error('readiness: database unreachable', { err: err.message });
+    return res.status(503).json({ ok: false, database: 'unreachable' });
+  }
+  res.json({ ok: true, database: 'ok' });
+}
+
+app.get(`${GATE}/health`, readiness);
+app.get(`${GATE}/health/ready`, readiness);
+
+// Liveness is deliberately not readiness, and the difference is not
+// pedantry. A liveness probe that checks Postgres tells the orchestrator to
+// *restart the gateway* when the database has a bad minute -- so a database
+// blip the pool would have ridden out becomes a rolling restart of every
+// instance, and the restarts keep coming for as long as the blip lasts.
+//
+// So: liveness answers "is this process still able to serve", readiness
+// answers "should traffic be sent to it right now", and only the second one
+// depends on anything downstream.
+app.get(`${GATE}/health/live`, (_req, res) => {
+  res.json({ ok: true, uptimeSeconds: Math.round(process.uptime()), version: SERVICE_VERSION });
+});
+
+// Prometheus scrape target. Served only when METRICS_TOKEN is set: the numbers
+// here describe how much access is being granted and how often sign-in fails,
+// which is reconnaissance on the one door into the internal network.
+//
+// The token is compared with timingSafeEqual over digests rather than the raw
+// strings, so that neither the length nor a shared prefix is measurable.
+app.get(`${GATE}/metrics`, (req, res) => {
+  if (!METRICS_TOKEN) return res.status(404).json({ error: 'Not found' });
+
+  const presented = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  const a = crypto.createHash('sha256').update(presented).digest();
+  const b = crypto.createHash('sha256').update(METRICS_TOKEN).digest();
+  if (!crypto.timingSafeEqual(a, b)) return res.status(404).json({ error: 'Not found' });
+
+  res.type('text/plain; version=0.0.4').send(metrics.render());
+});
 
 // The link in the access email points here.
 app.get(`${GATE}/link/:token`, (req, res) => {
@@ -714,7 +935,7 @@ function isValidEmail(value) {
 }
 
 app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, async (req, res) => {
-  const { email, password } = req.body || {};
+  const { email, password, totpCode, backupCode } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
   const normalised = String(email).trim().toLowerCase();
@@ -748,7 +969,11 @@ app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, as
     return deny('locked');
   }
 
-  if (!(await bcrypt.compare(password, admin.password_hash))) {
+  // Shared by the password branch and the second-factor branch below. A wrong
+  // code has to count towards the lockout exactly as a wrong password does --
+  // otherwise an attacker holding a valid password gets unlimited guesses at
+  // six digits, and the second factor is worth nothing.
+  const countFailure = async () => {
     const attempts = admin.failed_login_attempts + 1;
     const lock = attempts >= ADMIN_MAX_FAILED_ATTEMPTS;
     await pool.query(
@@ -764,18 +989,100 @@ app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, as
         detail: { minutes: ADMIN_LOCKOUT_MINUTES, afterAttempts: ADMIN_MAX_FAILED_ATTEMPTS },
       });
     }
+  };
+
+  if (!(await bcrypt.compare(password, admin.password_hash))) {
+    await countFailure();
+    metrics.counter('gateway_logins_total', { principal: 'admin', outcome: 'bad_password' });
     return deny('bad_password');
   }
 
-  // TOTP hook. The columns and this branch exist so enabling two-factor later
-  // is a feature flag rather than a migration; nothing verifies a code yet.
+  // ---- second factor ----
+  // Everything above this point answers identically whether or not the account
+  // exists. Below it, the reply necessarily differs: asking for a code tells
+  // the caller the password was right.
   //
-  // Unreachable by construction: schema.sql carries a CHECK constraint pinning
-  // totp_enabled to false, because this branch locks an admin out permanently
-  // with no recovery short of SQL. The database refuses the one state the code
-  // cannot handle; drop the constraint in the same change that implements TOTP.
+  // That leak is inherent to any second factor presented after a password, and
+  // it is the trade every two-step sign-in makes. It is acceptable here for the
+  // reason it is acceptable everywhere: what the attacker learns is that a
+  // password they already hold is correct, and the point of the second factor
+  // is that this is no longer enough. The alternative -- always demanding a
+  // code, including from accounts that have none -- turns an unenrolled admin's
+  // sign-in into an unexplainable failure.
+  let usedBackupCode = false;
   if (admin.totp_enabled) {
-    return res.status(501).json({ error: 'Two-factor is enabled for this account but not yet implemented' });
+    const submittedBackup = totp.normaliseBackupCode(backupCode);
+
+    if (!totpCode && !submittedBackup) {
+      // Not counted as a failure. No credential was guessed here -- the console
+      // simply has not asked for the code yet.
+      return res.status(401).json({
+        error: 'Enter the code from your authenticator app.',
+        reason: 'totp_required',
+      });
+    }
+
+    if (submittedBackup) {
+      const codes = await pool.query(
+        'SELECT id, code_hash FROM admin_backup_codes WHERE admin_id = $1 AND used_at IS NULL',
+        [admin.id]
+      );
+      // Every unused code is compared, with no early exit, so the time taken
+      // does not reveal the matching code's position in the list. They run
+      // concurrently on the threadpool -- sequentially this would hold the
+      // event loop, and therefore every proxied request, for the duration.
+      const results = await Promise.all(
+        codes.rows.map((row) => totp.verifyBackupCode(submittedBackup, row.code_hash))
+      );
+      const matched = codes.rows.find((_, i) => results[i])?.id || null;
+      if (!matched) {
+        await countFailure();
+        metrics.counter('gateway_logins_total', { principal: 'admin', outcome: 'bad_backup_code' });
+        return deny('bad_backup_code');
+      }
+      // Spent with the null check in the WHERE clause, so two sign-ins racing
+      // with the same code cannot both consume it -- one UPDATE returns a row
+      // and the other returns none.
+      const spent = await pool.query(
+        'UPDATE admin_backup_codes SET used_at = now() WHERE id = $1 AND used_at IS NULL RETURNING id',
+        [matched]
+      );
+      if (!spent.rows[0]) {
+        await countFailure();
+        return deny('backup_code_already_used');
+      }
+      usedBackupCode = true;
+
+      const left = await pool.query(
+        'SELECT count(*)::int AS n FROM admin_backup_codes WHERE admin_id = $1 AND used_at IS NULL',
+        [admin.id]
+      );
+      await audit(req, {
+        event: 'ADMIN_BACKUP_CODE_USED',
+        actor: admin.email,
+        detail: { remaining: left.rows[0].n },
+      });
+    } else {
+      // `afterStep` is what makes a code single-use: see admins.totp_last_step.
+      const step = totp.verify(admin.totp_secret, totpCode, { afterStep: admin.totp_last_step });
+      if (step === null) {
+        await countFailure();
+        metrics.counter('gateway_logins_total', { principal: 'admin', outcome: 'bad_totp' });
+        return deny('bad_totp');
+      }
+      // Conditional on the stored value so that two requests racing with the
+      // same code cannot both move the marker forward and both succeed.
+      const consumed = await pool.query(
+        `UPDATE admins SET totp_last_step = $2
+          WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)
+        RETURNING id`,
+        [admin.id, step]
+      );
+      if (!consumed.rows[0]) {
+        await countFailure();
+        return deny('totp_code_replayed');
+      }
+    }
   }
 
   await pool.query(
@@ -789,16 +1096,32 @@ app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, as
     { expiresIn: ADMIN_SESSION_TTL_SECONDS }
   );
 
-  await audit(req, { event: 'ADMIN_LOGIN_SUCCESS', actor: admin.email });
+  await audit(req, {
+    event: 'ADMIN_LOGIN_SUCCESS',
+    actor: admin.email,
+    detail: { secondFactor: admin.totp_enabled ? (usedBackupCode ? 'backup_code' : 'totp') : 'none' },
+  });
+  metrics.counter('gateway_logins_total', { principal: 'admin', outcome: 'success' });
 
   res.cookie(ADMIN_COOKIE_NAME, token, {
     ...adminCookieOptions(),
     maxAge: ADMIN_SESSION_TTL_SECONDS * 1000,
   });
-  res.json({ email: admin.email });
+  // The console needs both flags to know whether to route straight to a forced
+  // password change or an enrolment screen instead of the grants view.
+  res.json({
+    email: admin.email,
+    role: admin.role,
+    mustChangePassword: admin.must_change_password,
+    totpEnabled: admin.totp_enabled,
+    totpRequired: requireAdminTotp(),
+  });
 });
 
-app.post(`${GATE}/api/admin/auth/logout`, adminOnly, async (req, res) => {
+// adminAuthed, not adminOnly: someone stuck behind a forced password change or
+// a two-factor enrolment must still be able to sign out. A console you can
+// enter and not leave is a bug report.
+app.post(`${GATE}/api/admin/auth/logout`, adminAuthed, async (req, res) => {
   await audit(req, { event: 'ADMIN_LOGOUT', actor: req.admin.email });
   res.clearCookie(ADMIN_COOKIE_NAME, adminCookieOptions());
   res.json({ message: 'Signed out.' });
@@ -807,19 +1130,419 @@ app.post(`${GATE}/api/admin/auth/logout`, adminOnly, async (req, res) => {
 // Also carries the two limits the console needs to render honestly: it should
 // not offer a duration the server will reject, and it should be able to tell
 // an admin how long the link they are about to send stays openable.
-app.get(`${GATE}/api/admin/auth/me`, adminOnly, (req, res) => {
+//
+// adminAuthed rather than adminOnly, because this is how the console discovers
+// that it is in one of those states in the first place.
+app.get(`${GATE}/api/admin/auth/me`, adminAuthed, (req, res) => {
   res.json({
     email: req.admin.email,
+    role: req.admin.role,
+    mustChangePassword: req.admin.mustChangePassword,
+    totpEnabled: req.admin.totpEnabled,
+    totpRequired: requireAdminTotp(),
     maxDurationHours: MAX_DURATION_HOURS,
     pendingExpiryHours: PENDING_EXPIRY_HOURS,
+    requireGrantReason: requireGrantReason(),
   });
+});
+
+// ============================================================
+// Gate API -- the admin's own account
+// ============================================================
+// Everything in this section acts on req.admin and takes no id. Changing
+// someone else's password or resetting someone else's second factor is not
+// something this system offers at all: an owner can disable an account and
+// issue a new one, which is auditable and does not leave one admin able to
+// impersonate another.
+
+function passwordProblem(password) {
+  if (typeof password !== 'string' || password.length < ADMIN_MIN_PASSWORD_LENGTH) {
+    return `Password must be at least ${ADMIN_MIN_PASSWORD_LENGTH} characters.`;
+  }
+  // Capped because bcrypt silently truncates at 72 bytes: a 200-character
+  // passphrase would be stored as its first 72 and the rest would do nothing,
+  // which is worse than saying so.
+  if (Buffer.byteLength(password) > 72) return 'Password must be 72 bytes or fewer.';
+  return null;
+}
+
+app.post(`${GATE}/api/admin/auth/password`, adminAuthed, async (req, res) => {
+  const { currentPassword, newPassword } = req.body || {};
+
+  const problem = passwordProblem(newPassword);
+  if (problem) return res.status(400).json({ error: problem });
+  if (currentPassword === newPassword) {
+    return res.status(400).json({ error: 'The new password must be different.' });
+  }
+
+  const { rows } = await pool.query('SELECT password_hash FROM admins WHERE id = $1', [req.admin.id]);
+  // Re-checked even though the caller already holds a valid session. A session
+  // cookie is something an unattended laptop also has; the current password is
+  // what proves the person at the keyboard is the account holder.
+  if (!rows[0] || !(await bcrypt.compare(String(currentPassword || ''), rows[0].password_hash))) {
+    await audit(req, {
+      event: 'ADMIN_PASSWORD_CHANGE_FAILED',
+      actor: req.admin.email,
+      detail: { reason: 'bad_current_password' },
+    });
+    return res.status(401).json({ error: 'Current password is incorrect.' });
+  }
+
+  await pool.query(
+    `UPDATE admins
+        SET password_hash = $2, must_change_password = false, password_changed_at = now(),
+            failed_login_attempts = 0, locked_until = NULL
+      WHERE id = $1`,
+    [req.admin.id, await hashPassword(newPassword)]
+  );
+
+  await audit(req, { event: 'ADMIN_PASSWORD_CHANGED', actor: req.admin.email });
+  res.json({ message: 'Password updated.' });
+});
+
+// ---- two-factor enrolment ----
+// Three steps, because a secret that is stored the moment it is displayed
+// produces accounts that are half-enrolled: the admin closed the tab, the
+// column has a secret, and nothing can tell whether their phone has it too.
+//
+//   setup    issues a secret, stores it unconfirmed, returns it once
+//   enable   verifies a code against it, flips totp_enabled, issues backup codes
+//   disable  requires the password and a live code
+app.post(`${GATE}/api/admin/auth/totp/setup`, adminAuthed, async (req, res) => {
+  if (req.admin.totpEnabled) {
+    return res.status(409).json({ error: 'Two-factor is already enabled for this account.' });
+  }
+
+  const secret = totp.generateSecret();
+  // Overwrites any earlier unconfirmed secret. Calling setup twice means the
+  // admin restarted enrolment -- the first secret was never proved and must
+  // stop working, or two phones end up able to sign in as this account.
+  await pool.query(
+    'UPDATE admins SET totp_secret = $2, totp_confirmed_at = NULL WHERE id = $1',
+    [req.admin.id, secret]
+  );
+  await audit(req, { event: 'ADMIN_TOTP_SETUP_STARTED', actor: req.admin.email });
+
+  res.json({
+    secret,
+    // The issuer is the public hostname, so an admin holding codes for several
+    // environments can tell staging from production on their phone.
+    otpauthUri: totp.otpauthUri({
+      secret,
+      account: req.admin.email,
+      issuer: new URL(process.env.PUBLIC_BASE_URL).host,
+    }),
+    digits: totp.DIGITS,
+    periodSeconds: totp.STEP_SECONDS,
+  });
+});
+
+app.post(`${GATE}/api/admin/auth/totp/enable`, adminAuthed, async (req, res) => {
+  const { code } = req.body || {};
+  if (req.admin.totpEnabled) {
+    return res.status(409).json({ error: 'Two-factor is already enabled for this account.' });
+  }
+
+  const { rows } = await pool.query('SELECT totp_secret FROM admins WHERE id = $1', [req.admin.id]);
+  const secret = rows[0]?.totp_secret;
+  if (!secret) return res.status(409).json({ error: 'Start enrolment first.', reason: 'no_secret' });
+
+  const step = totp.verify(secret, code);
+  if (step === null) {
+    await audit(req, {
+      event: 'ADMIN_TOTP_ENABLE_FAILED',
+      actor: req.admin.email,
+      detail: { reason: 'bad_code' },
+    });
+    return res.status(400).json({ error: 'That code is not valid. Check your phone clock and try again.' });
+  }
+
+  // Recovery codes are generated here and shown exactly once. They are the
+  // answer to a lost phone, and without them the only recovery is SSH to the
+  // host -- which is a real control, but not one to rely on at 2am.
+  const codes = Array.from({ length: totp.BACKUP_CODE_COUNT }, () => totp.generateBackupCode());
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE admins
+          SET totp_enabled = true, totp_confirmed_at = now(), totp_last_step = $2
+        WHERE id = $1`,
+      [req.admin.id, step]
+    );
+    // Any codes from a previous enrolment are cleared, not added to: a set
+    // printed for an old secret must not still open the account.
+    await client.query('DELETE FROM admin_backup_codes WHERE admin_id = $1', [req.admin.id]);
+    // Hashed concurrently on the libuv threadpool rather than one after
+    // another. See lib/totp.js: ten sequential bcrypt hashes here would block
+    // the event loop -- and therefore every proxied request -- for seconds.
+    const hashes = await Promise.all(codes.map((code) => totp.hashBackupCode(code)));
+    await client.query(
+      `INSERT INTO admin_backup_codes (admin_id, code_hash)
+       SELECT $1, unnest($2::text[])`,
+      [req.admin.id, hashes]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  await audit(req, { event: 'ADMIN_TOTP_ENABLED', actor: req.admin.email });
+  res.json({ message: 'Two-factor enabled.', backupCodes: codes });
+});
+
+app.post(`${GATE}/api/admin/auth/totp/disable`, adminAuthed, async (req, res) => {
+  const { password, code } = req.body || {};
+  if (!req.admin.totpEnabled) {
+    return res.status(409).json({ error: 'Two-factor is not enabled for this account.' });
+  }
+  // Checked before anything is verified, because the answer does not depend on
+  // the credentials: when the deployment mandates two-factor, there is no
+  // combination of password and code that turns it off.
+  if (requireAdminTotp()) {
+    return res.status(403).json({
+      error: 'This deployment requires two-factor authentication. It cannot be turned off.',
+    });
+  }
+  // Turning the second factor off is the one action an attacker holding a
+  // stolen session cookie most wants, so it costs both the other factors.
+  const { rows } = await pool.query(
+    'SELECT password_hash, totp_secret, totp_last_step FROM admins WHERE id = $1',
+    [req.admin.id]
+  );
+  const admin = rows[0];
+  const passwordOk = admin && await bcrypt.compare(String(password || ''), admin.password_hash);
+  const codeOk = admin && totp.verify(admin.totp_secret, code, { afterStep: admin.totp_last_step }) !== null;
+  if (!passwordOk || !codeOk) {
+    await audit(req, {
+      event: 'ADMIN_TOTP_DISABLE_FAILED',
+      actor: req.admin.email,
+      detail: { reason: passwordOk ? 'bad_code' : 'bad_password' },
+    });
+    return res.status(401).json({ error: 'Password and a current code are both required.' });
+  }
+
+  await pool.query(
+    `UPDATE admins
+        SET totp_enabled = false, totp_secret = NULL, totp_confirmed_at = NULL, totp_last_step = NULL
+      WHERE id = $1`,
+    [req.admin.id]
+  );
+  await pool.query('DELETE FROM admin_backup_codes WHERE admin_id = $1', [req.admin.id]);
+
+  await audit(req, { event: 'ADMIN_TOTP_DISABLED', actor: req.admin.email });
+  res.json({ message: 'Two-factor disabled.' });
+});
+
+// Re-issuing recovery codes invalidates the previous set, which is the point:
+// it is what an admin does after using one, or after finding the printout in a
+// drawer they no longer trust.
+app.post(`${GATE}/api/admin/auth/totp/backup-codes`, adminAuthed, async (req, res) => {
+  const { password } = req.body || {};
+  if (!req.admin.totpEnabled) {
+    return res.status(409).json({ error: 'Two-factor is not enabled for this account.' });
+  }
+  const { rows } = await pool.query('SELECT password_hash FROM admins WHERE id = $1', [req.admin.id]);
+  if (!rows[0] || !(await bcrypt.compare(String(password || ''), rows[0].password_hash))) {
+    return res.status(401).json({ error: 'Password is incorrect.' });
+  }
+
+  const codes = Array.from({ length: totp.BACKUP_CODE_COUNT }, () => totp.generateBackupCode());
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('DELETE FROM admin_backup_codes WHERE admin_id = $1', [req.admin.id]);
+    const hashes = await Promise.all(codes.map((code) => totp.hashBackupCode(code)));
+    await client.query(
+      `INSERT INTO admin_backup_codes (admin_id, code_hash)
+       SELECT $1, unnest($2::text[])`,
+      [req.admin.id, hashes]
+    );
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+
+  await audit(req, { event: 'ADMIN_BACKUP_CODES_REISSUED', actor: req.admin.email });
+  res.json({ backupCodes: codes });
+});
+
+// ============================================================
+// Gate API -- team management
+// ============================================================
+// Creating admins used to require SSH to the host and `npm run create-admin`.
+// That was a real control -- recovery needed shell access -- but it does not
+// survive contact with a company: onboarding a colleague should not be a
+// deploy, and offboarding one at 6pm on a Friday must not wait for whoever
+// holds the SSH key.
+//
+// The control it replaces is kept in a different form: only an owner can do
+// any of this, every action is audited with both parties named, and there is
+// still no self-service signup and no password-reset email.
+
+const ADMIN_LIST_FIELDS = `id, email, role, disabled_at, last_login_at, created_at,
+                           totp_enabled, must_change_password`;
+
+// Owner and admin can see who else holds an account -- knowing which colleagues
+// can mint access is not privileged information within a team, and hiding it
+// mostly stops people noticing an account that should have been removed.
+app.get(`${GATE}/api/admin/admins`, adminOnly, requireRole('owner', 'admin'), async (_req, res) => {
+  const { rows } = await pool.query(
+    `SELECT ${ADMIN_LIST_FIELDS} FROM admins ORDER BY disabled_at NULLS FIRST, email`
+  );
+  res.json({ admins: rows, roles: ROLES });
+});
+
+app.post(`${GATE}/api/admin/admins`, adminOnly, requireRole('owner'), async (req, res) => {
+  const email = normaliseEmail(req.body?.email);
+  const role = String(req.body?.role || 'admin');
+
+  if (!isValidEmail(email)) return res.status(400).json({ error: 'Valid email required' });
+  if (!ROLES.includes(role)) {
+    return res.status(400).json({ error: `role must be one of: ${ROLES.join(', ')}` });
+  }
+
+  // Generated here rather than chosen by the creator. A password one person
+  // picks for another is a password that person still knows, and
+  // must_change_password below is what bounds how long that matters.
+  const temporaryPassword = generatePassword(20);
+
+  let created;
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO admins (email, password_hash, role, must_change_password)
+       VALUES ($1, $2, $3, true)
+       RETURNING ${ADMIN_LIST_FIELDS}`,
+      [email, await hashPassword(temporaryPassword), role]
+    );
+    created = rows[0];
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'That admin already exists.' });
+    throw err;
+  }
+
+  await audit(req, {
+    event: 'ADMIN_CREATED',
+    actor: req.admin.email,
+    detail: { subject: email, role },
+  });
+
+  // Returned once and never retrievable. The console shows it to the owner to
+  // relay; there is deliberately no email path for admin credentials, because
+  // an inbox is exactly where an attacker who has compromised one would look.
+  res.status(201).json({ admin: created, temporaryPassword });
+});
+
+// The two guards below are the same guard twice: an owner must not be able to
+// leave the system with no owner in it. Nothing in this application can create
+// the first owner, so recovering from that means SQL on the host -- which is
+// a fine last resort and a terrible thing to reach by clicking a button.
+async function otherActiveOwnerExists(excludingId) {
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS n FROM admins
+      WHERE role = 'owner' AND disabled_at IS NULL AND id <> $1`,
+    [excludingId]
+  );
+  return rows[0].n > 0;
+}
+
+app.post(`${GATE}/api/admin/admins/:id/role`, adminOnly, requireRole('owner'), async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Admin not found' });
+  const role = String(req.body?.role || '');
+  if (!ROLES.includes(role)) {
+    return res.status(400).json({ error: `role must be one of: ${ROLES.join(', ')}` });
+  }
+
+  const { rows: found } = await pool.query('SELECT id, email, role FROM admins WHERE id = $1', [req.params.id]);
+  const subject = found[0];
+  if (!subject) return res.status(404).json({ error: 'Admin not found' });
+  if (subject.role === role) return res.json({ admin: subject });
+
+  if (subject.role === 'owner' && !(await otherActiveOwnerExists(subject.id))) {
+    return res.status(409).json({ error: 'This is the last owner. Promote someone else first.' });
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE admins SET role = $2 WHERE id = $1 RETURNING ${ADMIN_LIST_FIELDS}`,
+    [subject.id, role]
+  );
+  await audit(req, {
+    event: 'ADMIN_ROLE_CHANGED',
+    actor: req.admin.email,
+    detail: { subject: subject.email, from: subject.role, to: role },
+  });
+  res.json({ admin: rows[0] });
+});
+
+// Disable rather than delete. The grants this person issued reference their row
+// -- see access_grants.created_by -- and an audit trail that has lost the name
+// of whoever authorised a window of access is not an audit trail.
+app.post(`${GATE}/api/admin/admins/:id/disable`, adminOnly, requireRole('owner'), async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Admin not found' });
+  if (req.params.id === req.admin.id) {
+    return res.status(409).json({ error: 'You cannot disable your own account.' });
+  }
+
+  const { rows: found } = await pool.query('SELECT id, email, role FROM admins WHERE id = $1', [req.params.id]);
+  const subject = found[0];
+  if (!subject) return res.status(404).json({ error: 'Admin not found' });
+  if (subject.role === 'owner' && !(await otherActiveOwnerExists(subject.id))) {
+    return res.status(409).json({ error: 'This is the last owner. Promote someone else first.' });
+  }
+
+  const { rows } = await pool.query(
+    `UPDATE admins SET disabled_at = now() WHERE id = $1 AND disabled_at IS NULL
+     RETURNING ${ADMIN_LIST_FIELDS}`,
+    [subject.id]
+  );
+  if (!rows[0]) return res.status(409).json({ error: 'That account is already disabled.' });
+
+  // Takes effect on their very next request, not at token expiry:
+  // requireAdminSession re-reads disabled_at on every call. That is the whole
+  // reason it re-reads.
+  await audit(req, {
+    event: 'ADMIN_DISABLED',
+    actor: req.admin.email,
+    detail: { subject: subject.email },
+  });
+  res.json({ admin: rows[0] });
+});
+
+app.post(`${GATE}/api/admin/admins/:id/enable`, adminOnly, requireRole('owner'), async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Admin not found' });
+
+  // The lockout counters are cleared alongside: an account disabled during an
+  // incident is often also an account that was being guessed at, and coming
+  // back to a fresh lockout is a confusing way to return.
+  const { rows } = await pool.query(
+    `UPDATE admins
+        SET disabled_at = NULL, failed_login_attempts = 0, locked_until = NULL
+      WHERE id = $1 AND disabled_at IS NOT NULL
+      RETURNING ${ADMIN_LIST_FIELDS}`,
+    [req.params.id]
+  );
+  if (!rows[0]) return res.status(404).json({ error: 'No disabled admin with that id.' });
+
+  await audit(req, {
+    event: 'ADMIN_ENABLED',
+    actor: req.admin.email,
+    detail: { subject: rows[0].email },
+  });
+  res.json({ admin: rows[0] });
 });
 
 // ============================================================
 // Gate API -- admin
 // ============================================================
 
-app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) => {
+app.post(`${GATE}/api/admin/grants`, adminOnly, requireRole('owner', 'admin'), createLimiter, async (req, res) => {
   const { durationHours, relay } = req.body || {};
   // Normalised before it is stored, because login normalises before it looks
   // up. Storing what the admin typed and matching on it exactly is what made a
@@ -830,6 +1553,16 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
   const hours = Number(durationHours);
   if (!Number.isFinite(hours) || hours <= 0 || hours > MAX_DURATION_HOURS) {
     return res.status(400).json({ error: `durationHours must be > 0 and <= ${MAX_DURATION_HOURS}` });
+  }
+
+  // Trimmed to null so that a field the admin tabbed through is stored as
+  // "absent" rather than as an empty string that reads like an answer.
+  const reason = String(req.body?.reason || '').trim().slice(0, MAX_REASON_LENGTH) || null;
+  if (requireGrantReason() && !reason) {
+    return res.status(400).json({
+      error: 'A reason is required. Reference the ticket, incident or contract this access is for.',
+      reason: 'reason_required',
+    });
   }
 
   // The invariant: at most one LIVE grant per email, where live means PENDING
@@ -870,9 +1603,13 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
   let grant;
   try {
     const { rows } = await pool.query(
-      `INSERT INTO access_grants (email, token_hash, password_hash, duration_seconds, status)
-       VALUES ($1, $2, $3, $4, 'PENDING') RETURNING id, email, status, created_at`,
-      [email, hashToken(token), await hashPassword(password), durationSeconds]
+      `INSERT INTO access_grants
+         (email, token_hash, password_hash, duration_seconds, status, reason,
+          created_by, created_by_email)
+       VALUES ($1, $2, $3, $4, 'PENDING', $5, $6, $7)
+       RETURNING id, email, status, created_at, reason, created_by_email`,
+      [email, hashToken(token), await hashPassword(password), durationSeconds, reason,
+        req.admin.id, req.admin.email]
     );
     grant = rows[0];
   } catch (err) {
@@ -893,13 +1630,21 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
     grantId: grant.id,
     event: 'GRANT_CREATED',
     actor: req.admin.email,
-    detail: { email, durationHours: hours },
+    detail: { email, durationHours: hours, reason },
   });
+  metrics.counter('gateway_grants_total', { transition: 'created' });
 
   const accessUrl = `${process.env.PUBLIC_BASE_URL}${GATE}/link/${token}`;
   const durationLabel = hoursLabel(hours);
   const payload = {
-    grant: { id: grant.id, email: grant.email, status: grant.status, createdAt: grant.created_at },
+    grant: {
+      id: grant.id,
+      email: grant.email,
+      status: grant.status,
+      createdAt: grant.created_at,
+      reason: grant.reason,
+      createdByEmail: grant.created_by_email,
+    },
     accessUrl,
   };
 
@@ -919,6 +1664,7 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
       actor: req.admin.email,
       detail: { error: err.message },
     });
+    metrics.counter('gateway_email_total', { outcome: 'failed' });
     // The grant is real even though the email is not, so hand the admin the
     // credentials to relay by hand. Without the password here the grant would
     // be dead on arrival and would have to be recreated.
@@ -936,6 +1682,7 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
   // admin and disagree with reality. Webhooks would close the gap and are not
   // on the plan; naming the event honestly is the next best thing.
   await audit(req, { grantId: grant.id, event: 'GRANT_EMAIL_ACCEPTED', actor: req.admin.email });
+  metrics.counter('gateway_email_total', { outcome: 'accepted' });
 
   // Opt-in, because the admin asked to read the password out rather than rely
   // on the email -- the reissue path, usually, after a message that was
@@ -958,11 +1705,41 @@ app.post(`${GATE}/api/admin/grants`, adminOnly, createLimiter, async (req, res) 
   res.status(201).json(payload);
 });
 
-app.get(`${GATE}/api/admin/grants`, adminOnly, async (_req, res) => {
+// Readable by every role, auditors included: reading who has access is the
+// whole job of an auditor, and it is the routes that change something that
+// carry a role check.
+//
+// Filterable, because a console that can only show the newest hundred rows
+// stops being useful at the point a company actually starts using it -- "did
+// this contractor ever have access" is unanswerable from a fixed window.
+app.get(`${GATE}/api/admin/grants`, adminOnly, async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500);
+  const conditions = [];
+  const params = [];
+
+  if (req.query.status) {
+    const statuses = String(req.query.status).split(',').map((s) => s.trim().toUpperCase());
+    const valid = statuses.filter((s) => GRANT_STATUSES.includes(s));
+    if (!valid.length) return res.status(400).json({ error: `status must be one of: ${GRANT_STATUSES.join(', ')}` });
+    params.push(valid);
+    conditions.push(`status = ANY($${params.length})`);
+  }
+  if (req.query.email) {
+    // Normalised, not pattern-matched: this searches for a person, and the
+    // index on access_grants(email) is on the raw column, so a LIKE with a
+    // leading wildcard would scan the table on every keystroke.
+    params.push(normaliseEmail(req.query.email));
+    conditions.push(`email = $${params.length}`);
+  }
+  params.push(limit);
+
   const { rows } = await pool.query(
     `SELECT id, email, status, created_at, activated_at, expires_at, activated_ip,
-            duration_seconds
-     FROM access_grants ORDER BY created_at DESC LIMIT 100`
+            duration_seconds, extended_seconds, reason, created_by_email, resend_count
+       FROM access_grants
+      ${conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''}
+      ORDER BY created_at DESC LIMIT $${params.length}`,
+    params
   );
   res.json({ grants: rows });
 });
@@ -983,7 +1760,7 @@ app.get(`${GATE}/api/admin/grants/live`, adminOnly, async (req, res) => {
   res.json({ grant: rows[0] || null });
 });
 
-app.post(`${GATE}/api/admin/grants/:id/revoke`, adminOnly, async (req, res) => {
+app.post(`${GATE}/api/admin/grants/:id/revoke`, adminOnly, requireRole('owner', 'admin'), async (req, res) => {
   // A malformed id is a 404, not a 500: an id that cannot exist is a grant
   // that does not exist, and Postgres should never see the value at all.
   if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Grant not found or not revocable' });
@@ -1002,22 +1779,358 @@ app.post(`${GATE}/api/admin/grants/:id/revoke`, adminOnly, async (req, res) => {
     actor: req.admin.email,
     detail: { reason: 'admin_action' },
   });
+  metrics.counter('gateway_grants_total', { transition: 'revoked' });
   res.json({ grant: rows[0] });
 });
 
+// Adds time to a window that is already running.
+//
+// Without this the only way to give someone another hour was to revoke and
+// reissue: new link, new password, a fresh email, and whatever they were in the
+// middle of thrown away. That is a bad enough experience that the real-world
+// workaround is to issue every grant for far longer than it needs to be, which
+// defeats the point of the product.
+//
+// The ceiling is on the total, not on the increment, so repeated extensions
+// cannot walk a one-hour grant past MAX_DURATION_HOURS an hour at a time.
+app.post(`${GATE}/api/admin/grants/:id/extend`, adminOnly, requireRole('owner', 'admin'), async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Grant not found' });
+
+  const addHours = Number(req.body?.addHours);
+  if (!Number.isFinite(addHours) || addHours <= 0) {
+    return res.status(400).json({ error: 'addHours must be greater than 0' });
+  }
+  const addSeconds = Math.round(addHours * 3600);
+
+  const { rows: found } = await pool.query(
+    `SELECT id, email, status, duration_seconds, extended_seconds, expires_at
+       FROM access_grants WHERE id = $1`,
+    [req.params.id]
+  );
+  const grant = found[0];
+  if (!grant || !['PENDING', 'ACTIVE'].includes(grant.status)) {
+    // An expired or revoked window is not extended, it is reissued. Reopening
+    // one would resurrect credentials that have already been treated as dead --
+    // including by whoever revoked them.
+    return res.status(409).json({ error: 'Only a pending or active grant can be extended.' });
+  }
+
+  const totalSeconds = grant.duration_seconds + grant.extended_seconds + addSeconds;
+  if (totalSeconds > MAX_DURATION_HOURS * 3600) {
+    return res.status(400).json({
+      error: `That would take the total past the ${MAX_DURATION_HOURS}-hour ceiling.`,
+      currentTotalHours: Number(((grant.duration_seconds + grant.extended_seconds) / 3600).toFixed(2)),
+      maxDurationHours: MAX_DURATION_HOURS,
+    });
+  }
+
+  // Two clocks again, and they move differently. An ACTIVE grant has a real
+  // expires_at to push out; a PENDING one has not started, so only the duration
+  // it will get when it does changes -- writing an expires_at onto it here
+  // would start the clock without anyone opening the link.
+  const { rows } = await pool.query(
+    `UPDATE access_grants
+        SET extended_seconds = extended_seconds + $2,
+            expires_at = CASE WHEN status = 'ACTIVE'
+                              THEN expires_at + ($3 || ' seconds')::interval
+                              ELSE expires_at END
+      WHERE id = $1 AND status IN ('PENDING','ACTIVE')
+      RETURNING id, email, status, expires_at, duration_seconds, extended_seconds`,
+    [grant.id, addSeconds, String(addSeconds)]
+  );
+  if (!rows[0]) return res.status(409).json({ error: 'Only a pending or active grant can be extended.' });
+
+  // The cached copy carries expires_at, and the proxy reads it on every
+  // request. Without this the customer keeps being cut off at the old time for
+  // up to GRANT_CACHE_TTL_MS after being told they had longer.
+  cacheBust(grant.id);
+  await audit(req, {
+    grantId: grant.id,
+    event: 'GRANT_EXTENDED',
+    actor: req.admin.email,
+    detail: {
+      addHours,
+      newExpiresAt: rows[0].expires_at,
+      totalHours: Number((totalSeconds / 3600).toFixed(2)),
+    },
+  });
+  metrics.counter('gateway_grants_total', { transition: 'extended' });
+  res.json({ grant: rows[0] });
+});
+
+// Re-sends the credentials for a grant that has not been opened yet, with a
+// new password and a new link.
+//
+// The common case is mundane: the message went to spam, or the address had a
+// typo the admin has since noticed on the phone. The old behaviour -- revoke
+// and reissue -- worked, but it made the audit trail read as though access had
+// been granted twice and withdrawn once, which is not what happened.
+//
+// Both secrets are rotated rather than re-sent. The first pair has been sitting
+// in a mail queue, a spam quarantine and possibly the wrong person's inbox; a
+// resend is exactly the moment to assume they are compromised.
+app.post(`${GATE}/api/admin/grants/:id/resend`, adminOnly, requireRole('owner', 'admin'), createLimiter, async (req, res) => {
+  if (!isUuid(req.params.id)) return res.status(404).json({ error: 'Grant not found' });
+  const { relay } = req.body || {};
+
+  const { rows: found } = await pool.query(
+    'SELECT id, email, status, duration_seconds, extended_seconds FROM access_grants WHERE id = $1',
+    [req.params.id]
+  );
+  const grant = found[0];
+  if (!grant) return res.status(404).json({ error: 'Grant not found' });
+  if (grant.status !== 'PENDING') {
+    // Deliberately not offered for an ACTIVE grant. The customer is already in;
+    // rotating the password under them would end their session and produce a
+    // support ticket rather than solve one.
+    return res.status(409).json({
+      error: 'Only a grant that has not been opened yet can be re-sent.',
+      status: grant.status,
+    });
+  }
+
+  const token = generateToken();
+  const password = generatePassword();
+
+  // created_at is reset with them, because PENDING_EXPIRY_HOURS runs from it:
+  // a link re-sent twenty-three hours in would otherwise arrive with an hour
+  // left on a clock the customer knows nothing about.
+  const { rows } = await pool.query(
+    `UPDATE access_grants
+        SET token_hash = $2, password_hash = $3, created_at = now(),
+            resend_count = resend_count + 1, failed_login_attempts = 0, locked_until = NULL
+      WHERE id = $1 AND status = 'PENDING'
+      RETURNING id, email, status, created_at, resend_count`,
+    [grant.id, hashToken(token), await hashPassword(password)]
+  );
+  if (!rows[0]) return res.status(409).json({ error: 'Only a grant that has not been opened yet can be re-sent.' });
+
+  const accessUrl = `${process.env.PUBLIC_BASE_URL}${GATE}/link/${token}`;
+  const hours = (grant.duration_seconds + grant.extended_seconds) / 3600;
+  const payload = { grant: rows[0], accessUrl };
+
+  await audit(req, {
+    grantId: grant.id,
+    event: 'GRANT_CREDENTIALS_REISSUED',
+    actor: req.admin.email,
+    detail: { resendCount: rows[0].resend_count },
+  });
+
+  try {
+    await sendAccessEmail({
+      to: grant.email,
+      accessUrl,
+      username: grant.email,
+      password,
+      durationLabel: hoursLabel(Number(hours.toFixed(2))),
+      linkExpiryLabel: hoursLabel(PENDING_EXPIRY_HOURS),
+    });
+  } catch (err) {
+    await audit(req, {
+      grantId: grant.id,
+      event: 'GRANT_EMAIL_FAILED',
+      actor: req.admin.email,
+      detail: { error: err.message, phase: 'resend' },
+    });
+    metrics.counter('gateway_email_total', { outcome: 'failed' });
+    // The old credentials are already dead at this point, so withholding the
+    // new ones would leave the grant unusable by anyone.
+    return res.status(202).json({
+      ...payload,
+      warning: 'Credentials rotated, but the email failed to send. Relay these manually.',
+      detail: err.message,
+      password,
+    });
+  }
+
+  metrics.counter('gateway_email_total', { outcome: 'accepted' });
+  await audit(req, { grantId: grant.id, event: 'GRANT_EMAIL_ACCEPTED', actor: req.admin.email });
+
+  if (relay) {
+    await audit(req, {
+      grantId: grant.id,
+      event: 'GRANT_PASSWORD_RELAYED',
+      actor: req.admin.email,
+      detail: { reason: 'admin_requested_manual_relay', phase: 'resend' },
+    });
+    return res.json({ ...payload, password });
+  }
+  res.json(payload);
+});
+
+// Builds the WHERE clause shared by the JSON and CSV views, so the export can
+// never disagree with what the console showed. Returns null when a parameter is
+// malformed, and the caller turns that into a 400.
+//
+// Every value is a bound parameter. The only thing interpolated into the SQL is
+// `$n`, generated from params.length.
+function auditFilters(query) {
+  const conditions = [];
+  const params = [];
+
+  if (query.grantId !== undefined && query.grantId !== '') {
+    // Same reasoning as revoke: this reaches a UUID column, so it is
+    // shape-checked rather than handed to Postgres to throw 22P02 on.
+    if (!isUuid(query.grantId)) return { error: 'grantId must be a UUID' };
+    params.push(query.grantId);
+    conditions.push(`grant_id = $${params.length}`);
+  }
+  if (query.event) {
+    // A list, because the questions people actually ask span several events:
+    // "every failed sign-in" is LOGIN_FAILED and ADMIN_LOGIN_FAILED.
+    const events = String(query.event).split(',').map((e) => e.trim().toUpperCase()).filter(Boolean);
+    if (events.length) {
+      params.push(events);
+      conditions.push(`event = ANY($${params.length})`);
+    }
+  }
+  if (query.actor) {
+    params.push(normaliseEmail(query.actor));
+    conditions.push(`lower(actor) = $${params.length}`);
+  }
+  for (const [key, op] of [['from', '>='], ['to', '<=']]) {
+    if (!query[key]) continue;
+    const at = new Date(query[key]);
+    if (Number.isNaN(at.getTime())) return { error: `${key} must be an ISO 8601 timestamp` };
+    params.push(at.toISOString());
+    conditions.push(`created_at ${op} $${params.length}`);
+  }
+
+  return { where: conditions.length ? `WHERE ${conditions.join(' AND ')}` : '', params };
+}
+
 app.get(`${GATE}/api/admin/audit-log`, adminOnly, async (req, res) => {
   const limit = Math.min(Number(req.query.limit) || 200, 1000);
-  const { grantId } = req.query;
-  // Same reasoning as revoke: this reaches a UUID column, so it is shape-checked.
-  if (grantId !== undefined && !isUuid(grantId)) {
-    return res.status(400).json({ error: 'grantId must be a UUID' });
-  }
-  const { rows } = grantId
-    ? await pool.query(
-        'SELECT * FROM audit_log WHERE grant_id = $1 ORDER BY created_at DESC LIMIT $2',
-        [grantId, limit])
-    : await pool.query('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT $1', [limit]);
+  const filters = auditFilters(req.query);
+  if (filters.error) return res.status(400).json({ error: filters.error });
+
+  const params = [...filters.params, limit];
+  const { rows } = await pool.query(
+    `SELECT * FROM audit_log ${filters.where} ORDER BY created_at DESC, id DESC LIMIT $${params.length}`,
+    params
+  );
   res.json({ events: rows });
+});
+
+// A field is quoted whenever it contains a delimiter, a quote or a newline, and
+// an embedded quote is doubled. That is the whole of RFC 4180, and it is here
+// rather than as a dependency for the same reason as everything else in this
+// codebase's lib/.
+//
+// The leading apostrophe on a value starting with = + - @ is not RFC 4180 and
+// is not decoration: spreadsheets treat those as the start of a formula, so an
+// audit row whose actor is `=HYPERLINK(...)` becomes a live formula the moment
+// a compliance reviewer opens the export. The export is read in Excel far more
+// often than by a parser, and that is the reader worth protecting.
+function csvField(value) {
+  if (value == null) return '';
+  let text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+  return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+// CSV rather than the JSON above, because the person asking for this is
+// producing evidence for an auditor, and "export the access log for Q3" ends in
+// a spreadsheet every time. Streamed, and capped well above the JSON view: an
+// export that silently stops at a thousand rows is worse than no export, since
+// nothing in the file says it is incomplete.
+app.get(`${GATE}/api/admin/audit-log.csv`, adminOnly, async (req, res) => {
+  const filters = auditFilters(req.query);
+  if (filters.error) return res.status(400).json({ error: filters.error });
+
+  const limit = Math.min(Number(req.query.limit) || 100_000, 500_000);
+  const params = [...filters.params, limit];
+
+  const stamp = new Date().toISOString().slice(0, 10);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', `attachment; filename="audit-log-${stamp}.csv"`);
+
+  // Paging the query bounds how much is read from Postgres at once; this
+  // bounds how much is held for a client that reads slowly. Without it,
+  // res.write() returning false is ignored and Node buffers the remainder in
+  // memory -- so a large export over a slow connection reintroduces exactly
+  // the problem the paging was there to avoid.
+  //
+  // 'close' resolves it as well as 'drain'. A client that disconnects while
+  // the buffer is full never drains, and waiting on 'drain' alone would leave
+  // this handler awaiting an event that is now impossible -- one leaked
+  // request context per cancelled download, held for the life of the process.
+  const write = (chunk) => {
+    if (res.write(chunk)) return null;
+    return new Promise((resolve) => {
+      const done = () => {
+        res.off('drain', done);
+        res.off('close', done);
+        resolve();
+      };
+      res.once('drain', done);
+      res.once('close', done);
+    });
+  };
+
+  await write('id,created_at,event,actor,grant_id,ip_address,user_agent,request_id,detail\n');
+
+  // Cursored rather than one query with a huge LIMIT: a 500,000-row result set
+  // is materialised in this process's memory before the first byte is written,
+  // and this is the process every customer's traffic flows through.
+  const PAGE = 2000;
+  let after = null;
+  let written = 0;
+  try {
+    while (written < limit) {
+      const pageParams = [...filters.params];
+      let cursor = '';
+      if (after !== null) {
+        pageParams.push(after);
+        cursor = filters.where ? ` AND id < $${pageParams.length}` : ` WHERE id < $${pageParams.length}`;
+      }
+      pageParams.push(Math.min(PAGE, limit - written));
+
+      const { rows } = await pool.query(
+        `SELECT id, created_at, event, actor, grant_id, ip_address, user_agent, request_id, detail
+           FROM audit_log ${filters.where}${cursor}
+          ORDER BY id DESC LIMIT $${pageParams.length}`,
+        pageParams
+      );
+      if (!rows.length) break;
+
+      for (const row of rows) {
+        await write([
+          row.id, row.created_at.toISOString(), row.event, row.actor, row.grant_id,
+          row.ip_address, row.user_agent, row.request_id, row.detail,
+        ].map(csvField).join(',') + '\n');
+      }
+      written += rows.length;
+
+      // A client that navigated away or cancelled the download. Without this
+      // the loop keeps querying Postgres and writing into a dead socket for
+      // however many pages remain.
+      if (res.writableEnded || res.destroyed) {
+        req.log.debug('audit CSV export abandoned by the client', { written });
+        return;
+      }
+      after = rows[rows.length - 1].id;
+      if (rows.length < PAGE) break;
+    }
+  } catch (err) {
+    // Headers are long gone, so there is no status code left to change. Ending
+    // the response without the trailer below is what tells the caller the file
+    // is short -- and the log line is what tells us why.
+    req.log.error('audit CSV export failed mid-stream', { err: err.message, written });
+    return res.end();
+  }
+
+  await audit(req, {
+    event: 'AUDIT_LOG_EXPORTED',
+    actor: req.admin.email,
+    detail: { rows: written, filters: { ...req.query } },
+  });
+  // A terminator, so a truncated download is detectable. Prefixed with # so
+  // it is a comment to most parsers and obvious to a human either way.
+  //
+  // Written only on the path that ran to completion: every early return above
+  // leaves the file without it, which is the signal.
+  res.end(`#end,${written} rows\n`);
 });
 
 // ============================================================
@@ -1075,6 +2188,7 @@ app.get(`${GATE}/api/activate/:token`, activateLimiter, async (req, res) => {
       actor: grant.email,
       detail: { expiresAt },
     });
+    metrics.counter('gateway_grants_total', { transition: 'activated' });
     return res.json({ message: 'Access activated.', activatedAt: now, expiresAt });
   }
 
@@ -1198,6 +2312,7 @@ app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
       actor: email,
       detail: { reason: 'bad_password', attempts },
     });
+    metrics.counter('gateway_logins_total', { principal: 'customer', outcome: 'bad_password' });
     if (lock) {
       await audit(req, {
         grantId: grant.id,
@@ -1205,6 +2320,7 @@ app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
         actor: email,
         detail: { minutes: GRANT_LOCKOUT_MINUTES, afterAttempts: GRANT_MAX_FAILED_ATTEMPTS },
       });
+      metrics.counter('gateway_logins_total', { principal: 'customer', outcome: 'locked' });
       return res.status(429).json({
         error: `Too many failed attempts. Try again in ${GRANT_LOCKOUT_MINUTES} minutes.`,
         reason: 'locked',
@@ -1234,6 +2350,7 @@ app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
     actor: grant.email,
     detail: { sessionExpiresAt: new Date(sessionExpiry) },
   });
+  metrics.counter('gateway_logins_total', { principal: 'customer', outcome: 'success' });
 
   res.cookie(COOKIE_NAME, sessionToken, { ...cookieOptions(), maxAge: expiresInSeconds * 1000 });
   res.json({ expiresAt: grant.expires_at, sessionExpiresAt: new Date(sessionExpiry) });
@@ -1436,8 +2553,9 @@ const proxyCommon = {
       // Set unconditionally for the same reason as the headers above.
       if (UPSTREAM_SHARED_SECRET) proxyReq.setHeader(UPSTREAM_SECRET_HEADER, UPSTREAM_SHARED_SECRET);
     },
-    error: (err, _req, res) => {
-      console.error('proxy error:', err.message);
+    error: (err, req, res) => {
+      metrics.counter('gateway_upstream_errors_total', { code: err.code || 'unknown' });
+      (req?.log || log).error('proxy error', { err: err.message, code: err.code });
       if (res && !res.headersSent && typeof res.status === 'function') {
         res.status(502).json({ error: 'The application behind the gateway is unreachable.' });
       }
@@ -1508,10 +2626,13 @@ app.use(async (req, res, next) => {
 // ============================================================
 // Error handling
 // ============================================================
-app.use((err, _req, res, _next) => {
-  console.error('unhandled error:', err);
+app.use((err, req, res, _next) => {
+  // The request id goes into the body as well as the log line. It is the only
+  // thing a customer can usefully quote from a 500, and without it a support
+  // conversation starts with "roughly what time was that".
+  (req?.log || log).error('unhandled error', { err, path: req?.path });
   if (res.headersSent) return;
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({ error: 'Internal server error', requestId: req?.id });
 });
 
 // ============================================================
@@ -1528,6 +2649,7 @@ async function sweepExpired() {
        WHERE status = 'ACTIVE' AND expires_at IS NOT NULL AND expires_at <= now()
        RETURNING id`
     );
+    metrics.counter('gateway_grants_total', { transition: 'expired' }, closed.rows.length);
     for (const row of closed.rows) {
       cacheBust(row.id);
       await audit(null, {
@@ -1548,6 +2670,7 @@ async function sweepExpired() {
        RETURNING id`,
       [String(PENDING_EXPIRY_HOURS)]
     );
+    metrics.counter('gateway_grants_total', { transition: 'link_expired' }, unopened.rows.length);
     for (const row of unopened.rows) {
       cacheBust(row.id);
       await audit(null, {
@@ -1558,10 +2681,42 @@ async function sweepExpired() {
       });
     }
 
-    if (closed.rows.length) console.log(`sweeper: expired ${closed.rows.length} access window(s)`);
-    if (unopened.rows.length) console.log(`sweeper: expired ${unopened.rows.length} unopened link(s)`);
+    if (closed.rows.length || unopened.rows.length) {
+      log.info('sweeper closed grants', {
+        expiredWindows: closed.rows.length,
+        expiredLinks: unopened.rows.length,
+      });
+    }
   } catch (err) {
-    console.error('sweeper failed:', err.message);
+    log.error('sweeper failed', { err: err.message });
+  }
+}
+
+// Gauges are point-in-time, so something has to set them. The sweeper is
+// already the one thing that wakes on a timer and already talks to the
+// database, and a scrape-time query would put an unauthenticated-ish endpoint
+// on the critical path of the database this gateway cannot serve without.
+async function refreshGauges() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT status, count(*)::int AS n FROM access_grants
+        WHERE status IN ('PENDING','ACTIVE') GROUP BY status`
+    );
+    const counts = Object.fromEntries(rows.map((r) => [r.status, r.n]));
+    for (const status of ['PENDING', 'ACTIVE']) {
+      metrics.gauge('gateway_grants_live', { status }, counts[status] || 0);
+    }
+
+    if (webhooks.enabled()) {
+      const { rows: pending } = await pool.query(
+        "SELECT count(*)::int AS n FROM webhook_outbox WHERE status = 'PENDING'"
+      );
+      metrics.gauge('gateway_webhook_outbox_pending', null, pending[0].n);
+    }
+  } catch (err) {
+    // Never fatal, and never retried: the next tick is a minute away and a
+    // stale gauge is a smaller problem than a sweeper that stops sweeping.
+    log.warn('metrics refresh failed', { err: err.message });
   }
 }
 
@@ -1576,18 +2731,31 @@ async function checkAdminSetup() {
       'SELECT count(*)::int AS n FROM admins WHERE disabled_at IS NULL'
     );
     if (rows[0].n === 0) {
-      console.warn('  WARNING: no admin accounts exist. Run: npm run create-admin');
+      log.warn('no admin accounts exist -- nobody can issue access. Run: npm run create-admin');
     } else {
-      console.log(`  admins   : ${rows[0].n} active`);
+      log.info('admin accounts', { active: rows[0].n });
+    }
+
+    // An owner is the only role that can add or remove admins. A database
+    // where every owner has been disabled is recoverable only with SQL, and
+    // the symptom -- a 403 on the team page -- does not point at the cause.
+    const owners = await pool.query(
+      "SELECT count(*)::int AS n FROM admins WHERE role = 'owner' AND disabled_at IS NULL"
+    );
+    if (rows[0].n > 0 && owners.rows[0].n === 0) {
+      log.warn('no active owner: nobody can manage admin accounts from the console');
     }
   } catch (err) {
-    console.error('  WARNING: could not read the admins table. Has schema.sql been applied?');
-    console.error(`           ${err.message}`);
+    log.error('could not read the admins table -- has schema.sql been applied?', { err: err.message });
   }
 
   if (!ADMIN_IP_ALLOWLIST.length && COOKIE_SECURE) {
-    console.warn('  WARNING: ADMIN_IP_ALLOWLIST is empty, so the admin console answers');
-    console.warn('           the public internet. Scope it to your VPN or office range.');
+    log.warn('ADMIN_IP_ALLOWLIST is empty, so the admin console answers the public '
+      + 'internet. Scope it to your VPN or office range.');
+  }
+  if (!requireAdminTotp() && COOKIE_SECURE) {
+    log.warn('ADMIN_REQUIRE_TOTP is off. A stolen admin password is enough to mint '
+      + 'access to the internal network.');
   }
 }
 
@@ -1634,11 +2802,13 @@ async function warnIfUpstreamIsPublic() {
   const publicAddresses = addresses.filter(isPublicAddress);
   if (!publicAddresses.length) return;
 
-  console.warn(`  WARNING: UPSTREAM_URL resolves to a public address (${publicAddresses.join(', ')}).`);
-  console.warn('           If customers can reach the app directly, this gateway is decoration.');
-  if (!UPSTREAM_SHARED_SECRET) {
-    console.warn('           Set UPSTREAM_SHARED_SECRET and reject requests without it in the app.');
-  }
+  log.warn('UPSTREAM_URL resolves to a public address. If customers can reach the app '
+    + 'directly, this gateway is decoration.', {
+    addresses: publicAddresses,
+    remedy: UPSTREAM_SHARED_SECRET
+      ? undefined
+      : 'Set UPSTREAM_SHARED_SECRET and reject requests without it in the app.',
+  });
 }
 
 // Email failure is survivable -- grant creation hands the admin the password
@@ -1648,12 +2818,12 @@ async function warnIfUpstreamIsPublic() {
 function checkEmailSetup() {
   const provider = resolveEmailProvider();
   if (provider.ready && process.env.EMAIL_FROM) {
-    console.log(`  email    : ${provider.name}`);
+    log.info('email configured', { provider: provider.name });
     return;
   }
   const missing = provider.ready ? 'EMAIL_FROM' : provider.missing;
-  console.warn(`  WARNING: email is not configured (missing ${missing}). Grants will still be`);
-  console.warn('           created, but the admin has to relay each password by hand.');
+  log.warn('email is not configured. Grants will still be created, but the admin has to '
+    + 'relay each password by hand.', { missing });
 }
 
 // Exported rather than run on require, so the tests can start a gateway on an
@@ -1684,19 +2854,46 @@ async function start({ handleSignals = false } = {}) {
     }
   });
 
-  console.log(`gateway listening on :${port}`);
-  console.log(`  upstream : ${UPSTREAM_URL}`);
-  console.log(`  public   : ${process.env.PUBLIC_BASE_URL}`);
-  console.log(`  admin    : ${process.env.PUBLIC_BASE_URL}${GATE}/admin`);
+  // One line with fields rather than the aligned banner this used to print.
+  // In pretty mode it still reads like a banner; in json mode it is a record a
+  // collector can answer "what was deployed, where, on the 4th" from.
+  log.info('gateway listening', {
+    port,
+    version: SERVICE_VERSION,
+    upstream: UPSTREAM_URL,
+    public: process.env.PUBLIC_BASE_URL,
+    admin: `${process.env.PUBLIC_BASE_URL}${GATE}/admin`,
+    requireTotp: requireAdminTotp(),
+    requireGrantReason: requireGrantReason(),
+    metrics: METRICS_TOKEN ? `${GATE}/metrics` : 'disabled',
+    webhooks: webhooks.enabled() ? 'enabled' : 'disabled',
+  });
+  metrics.gauge('gateway_build_info', { version: SERVICE_VERSION, node: process.version }, 1);
   checkEmailSetup();
   await checkAdminSetup();
   await warnIfUpstreamIsPublic();
 
-  const sweepTimer = setInterval(() => {
-    sweepExpired();
-    sweepGrantCache();
-  }, SWEEP_INTERVAL_MS);
-  sweepExpired();
+  // One background clock for everything periodic. Each job guards its own
+  // errors, and `running` stops a slow tick from overlapping the next one --
+  // two concurrent webhook drains against a shared outbox would rely entirely
+  // on SKIP LOCKED to stay correct, and a job should not need the database to
+  // save it from its own scheduler.
+  let running = false;
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try {
+      await sweepExpired();
+      sweepGrantCache();
+      await webhooks.drain(pool);
+      await refreshGauges();
+    } finally {
+      running = false;
+    }
+  };
+
+  const sweepTimer = setInterval(tick, SWEEP_INTERVAL_MS);
+  tick();
 
   const stop = async () => {
     clearInterval(sweepTimer);
@@ -1707,10 +2904,19 @@ async function start({ handleSignals = false } = {}) {
   if (handleSignals) {
     for (const sig of ['SIGTERM', 'SIGINT']) {
       process.on(sig, () => {
-        console.log(`${sig} received, shutting down`);
+        log.info('shutting down', { signal: sig });
         clearInterval(sweepTimer);
+        // server.close() stops accepting and waits for in-flight requests. On a
+        // proxy that is not a formality: a customer mid-upload should finish,
+        // not get a truncated response because a deploy landed.
         server.close(() => pool.end().then(() => process.exit(0)));
-        setTimeout(() => process.exit(1), 10_000).unref();
+        // The deadline is shorter than the orchestrator's own grace period
+        // (Docker and Kubernetes both default to 30s), so this process is what
+        // decides how it dies rather than being SIGKILLed with the pool open.
+        setTimeout(() => {
+          log.warn('shutdown timed out with connections still open; exiting anyway');
+          process.exit(1);
+        }, Number(process.env.SHUTDOWN_TIMEOUT_MS || 15_000)).unref();
       });
     }
   }
@@ -1720,7 +2926,7 @@ async function start({ handleSignals = false } = {}) {
 
 if (require.main === module) {
   start({ handleSignals: true }).catch((err) => {
-    console.error(`Refusing to start. ${err.message}`);
+    log.error('refusing to start', { err: err.message });
     process.exit(1);
   });
 }
@@ -1742,4 +2948,12 @@ module.exports = {
   relaxCspForBanner,
   renderAccessEmail,
   resolveEmailProvider,
+  csvField,
+  auditFilters,
+  // The webhook outbox and the gauges are driven by the same timer as the
+  // sweeper; the tests drive them directly for the same reason.
+  refreshGauges,
+  webhooks,
+  metrics,
+  totp,
 };

@@ -327,3 +327,91 @@ tr.highlight td {
 .notice p { margin: 0 0 8px; }
 .notice .notice-title { color: var(--ink); font-weight: 600; }
 .notice-actions { display: flex; gap: 8px; margin-top: 12px; }
+
+/* ---------- Console navigation ---------- */
+/* The console grew from one form into four jobs -- issuing access, reading the
+   log, managing the team, and this admin's own credentials. Tabs rather than
+   four pages: the whole console is one static file with no build step and no
+   router, and a page reload would lose the grant list on every switch. */
+.tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 0 4px;
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+}
+.tab {
+  padding: 9px 14px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--slate);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tab:hover { color: var(--ink); }
+.tab.on { color: var(--ink); border-bottom-color: var(--brass); }
+
+/* Section heading inside a panel. h1 was being used at 16px for these, which
+   left the page with five level-one headings and nothing below them. */
+h2 {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 16px;
+  font-weight: 700;
+  margin: 28px 0 4px;
+}
+h2:first-child { margin-top: 8px; }
+
+/* Non-destructive inline action. button.mini is rust-coloured because its
+   first and only use was Revoke; extending or re-sending is not that. */
+button.mini.go { color: var(--moss); }
+button.mini.go:hover { border-color: var(--moss); }
+
+.badge.role { color: var(--slate); background: rgba(107, 114, 128, 0.14); }
+.badge.role::before { display: none; }
+
+/* Recovery codes and the TOTP secret. Monospace, selectable, and laid out so
+   ten codes can be read down a column rather than hunted for in a paragraph. */
+.codes {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px;
+  margin-top: 10px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  user-select: all;
+}
+.codes span {
+  padding: 8px 10px;
+  background: var(--paper-dim);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  text-align: center;
+}
+
+/* Filter strip above the audit table. Wraps rather than scrolls: these are
+   inputs, and a control half off the edge of a scroll container is a control
+   nobody finds. */
+.filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.filters > * { flex: 1 1 150px; min-width: 0; }
+.filters label { margin-top: 0; }
+
+.ok-text { color: var(--moss); font-size: 13px; margin-top: 10px; display: none; }
+.ok-text.show { display: block; }
+
+/* Detail column of the audit table. Long JSON must not stretch the table
+   until the columns that matter are off-screen. */
+td.detail {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 11px;
+  color: var(--slate);
+  max-width: 260px;
+  overflow-wrap: anywhere;
+}
+
+/* Keeps a short marker beside a status badge from wrapping mid-token in the
+   narrow status column. */
+.nowrap { white-space: nowrap; }

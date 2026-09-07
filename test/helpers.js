@@ -98,6 +98,16 @@ async function boot() {
     ADMIN_LOGIN_RATE_MAX: '10000',
     SWEEP_INTERVAL_MS: '3600000',
     ADMIN_IP_ALLOWLIST: '',
+    // The new controls default to off so the existing tests describe the
+    // shipped defaults. The tests that cover them set them per-case through
+    // the same process.env the server reads at call time.
+    ADMIN_REQUIRE_TOTP: '',
+    REQUIRE_GRANT_REASON: '',
+    METRICS_TOKEN: 'test-metrics-token',
+    WEBHOOK_URL: '',
+    WEBHOOK_SECRET: '',
+    LOG_LEVEL: 'error',
+    LOG_FORMAT: 'json',
   });
 
   server = require('../server.js');
@@ -150,7 +160,14 @@ const query = (...args) => server.pool.query(...args);
 const sweep = () => server.sweepExpired();
 
 async function resetDb() {
-  await query('TRUNCATE audit_log, access_grants, admins RESTART IDENTITY CASCADE');
+  // admin_backup_codes and webhook_outbox came later; CASCADE from admins
+  // covers the first, and the second has no foreign key at all, so it is named
+  // explicitly. A table left out here leaks rows between tests, and the
+  // symptom is a test that passes alone and fails in the suite.
+  await query(
+    'TRUNCATE audit_log, access_grants, admins, admin_backup_codes, webhook_outbox '
+    + 'RESTART IDENTITY CASCADE'
+  );
   upstream.reset();
 }
 
@@ -216,16 +233,30 @@ async function makeGrant({
   return { ...rows[0], token, password };
 }
 
-async function makeAdmin({ email = 'admin@example.com', password = 'admin-password-123' } = {}) {
+async function makeAdmin({
+  email = 'admin@example.com',
+  password = 'admin-password-123',
+  role = 'owner',
+  mustChangePassword = false,
+  totpSecret = null,
+} = {}) {
   const { rows } = await query(
-    'INSERT INTO admins (email, password_hash) VALUES ($1, $2) RETURNING *',
-    [email, bcrypt.hashSync(password, 4)]
+    `INSERT INTO admins (email, password_hash, role, must_change_password,
+                         totp_secret, totp_enabled)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [email, bcrypt.hashSync(password, 4), role, mustChangePassword,
+      totpSecret, Boolean(totpSecret)]
   );
   return { ...rows[0], password };
 }
 
-async function signIn(as, { email = 'admin@example.com', password = 'admin-password-123' } = {}) {
-  return as.json('/__access/api/admin/auth/login', { email, password });
+async function signIn(as, {
+  email = 'admin@example.com',
+  password = 'admin-password-123',
+  totpCode,
+  backupCode,
+} = {}) {
+  return as.json('/__access/api/admin/auth/login', { email, password, totpCode, backupCode });
 }
 
 // Forges a session cookie directly. Some states -- an expired JWT against a
@@ -257,7 +288,19 @@ module.exports = {
   sessionCookie,
   auditEvents,
   hashToken,
+  METRICS_TOKEN: 'test-metrics-token',
   UPSTREAM_SECRET,
   COOKIE_NAME: 'ta_session',
   ADMIN_COOKIE_NAME: 'ta_admin',
 };
+
+// A note on running these files.
+//
+// `node --test` runs test FILES in parallel by default. Every integration file
+// here points at the same TEST_DATABASE_URL and truncates every table between
+// cases, so two files running at once delete each other's fixtures -- and the
+// failures land in whichever file happened to be mid-assertion, which is never
+// the one with the problem.
+//
+// npm test therefore pins --test-concurrency=1. Running a single file directly
+// needs no flag; running two by hand does.

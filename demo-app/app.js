@@ -102,6 +102,13 @@ app.get('/', (req, res) => {
 </body></html>`);
 });
 
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`demo upstream app listening on http://127.0.0.1:${PORT}`);
+// Loopback by default, because on a laptop this stand-in should not be
+// reachable from the rest of the network -- the one property the real app is
+// supposed to have. In a container loopback would also hide it from the
+// gateway container, so compose sets DEMO_HOST=0.0.0.0 and the container
+// network boundary plus the shared-secret check above take over the job.
+const HOST = process.env.DEMO_HOST || '127.0.0.1';
+
+app.listen(PORT, HOST, () => {
+  console.log(`demo upstream app listening on http://${HOST}:${PORT}`);
 });

@@ -207,3 +207,57 @@ test('resolveEmailProvider picks a backend and reports what is missing', () => {
     Object.assign(process.env, saved);
   }
 });
+
+// ------------------------------------------------------------------
+// CSV export
+// ------------------------------------------------------------------
+const { csvField, auditFilters } = require('../server.js');
+
+test('csvField quotes only what needs quoting, and doubles embedded quotes', () => {
+  assert.equal(csvField('plain'), 'plain');
+  assert.equal(csvField(null), '');
+  assert.equal(csvField(undefined), '');
+  assert.equal(csvField(42), '42');
+  assert.equal(csvField('has,comma'), '"has,comma"');
+  assert.equal(csvField('has"quote'), '"has""quote"');
+  assert.equal(csvField('has\nnewline'), '"has\nnewline"');
+  // An object is the detail column, and it arrives as JSON.
+  assert.equal(csvField({ a: 1 }), '"{""a"":1}"');
+});
+
+test('csvField defuses a value a spreadsheet would run as a formula', () => {
+  // The export is opened in Excel far more often than it is parsed, and there
+  // it is the reader who is at risk, not the format.
+  for (const dangerous of ['=1+1', '+1', '-1', '@SUM(A1)', '\tstart']) {
+    const out = csvField(dangerous);
+    assert.equal(out.replace(/^"|"$/g, '').startsWith("'"), true, dangerous);
+  }
+  // A leading apostrophe is added, not a replacement: the value is still
+  // readable, and this is not silent data loss.
+  assert.equal(csvField('=HYPERLINK("x")'), '"\'=HYPERLINK(""x"")"');
+  // Ordinary values are untouched.
+  assert.equal(csvField('a=b'), 'a=b');
+  assert.equal(csvField('2026-09-06T00:00:00.000Z'), '2026-09-06T00:00:00.000Z');
+});
+
+test('auditFilters binds every value and interpolates only placeholders', () => {
+  const none = auditFilters({});
+  assert.equal(none.where, '');
+  assert.deepEqual(none.params, []);
+
+  const some = auditFilters({ event: 'a,b', actor: 'ME@Example.com', from: '2026-01-01' });
+  // Placeholders are numbered from the parameter array, never from the input.
+  assert.equal(some.where, 'WHERE event = ANY($1) AND lower(actor) = $2 AND created_at >= $3');
+  assert.deepEqual(some.params[0], ['A', 'B']);
+  assert.equal(some.params[1], 'me@example.com');
+
+  // A value that would be an injection if it were interpolated is just a
+  // parameter that matches nothing.
+  const hostile = auditFilters({ actor: "'; DROP TABLE audit_log; --" });
+  assert.equal(hostile.where, 'WHERE lower(actor) = $1');
+  assert.equal(hostile.params.length, 1);
+
+  // Malformed input is reported, not thrown and not silently ignored.
+  assert.match(auditFilters({ grantId: 'nope' }).error, /UUID/);
+  assert.match(auditFilters({ from: 'yesterday' }).error, /ISO 8601/);
+});

@@ -1,0 +1,17 @@
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+.env.bak*
+*.log
+docs
+test
+README.md
+DEPLOY.md
+LICENSE
+deploy
+Dockerfile
+.dockerignore
+docker-compose.yml
+.github

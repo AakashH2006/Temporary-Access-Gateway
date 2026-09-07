@@ -6,6 +6,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 
 const h = require('./helpers.js');
 
@@ -35,6 +37,22 @@ test('gateway', { skip: h.skip, concurrency: 1 }, async (t) => {
     const res = await c.json('/__access/api/not-a-real-route', {});
     assert.equal(res.status, 404);
     assert.equal(h.upstream.requests.length, 0);
+  });
+
+  // The one gate URL that answers before anyone has authenticated, which is
+  // why what it does NOT say matters as much as what it does. It used to
+  // return UPSTREAM_URL -- the address of the app the whole system exists to
+  // keep off the public internet -- to any anonymous caller.
+  await t.test('health reports the database without disclosing the upstream', async () => {
+    const c = h.client();
+    const res = await c('/__access/health');
+    const body = await res.json();
+
+    assert.equal(res.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.database, 'ok');
+    assert.equal(JSON.stringify(body).includes(String(h.upstream.port)), false);
+    assert.equal('upstream' in body, false);
   });
 
   // ----------------------------------------------------------------
@@ -724,11 +742,51 @@ test('gateway', { skip: h.skip, concurrency: 1 }, async (t) => {
   // ----------------------------------------------------------------
   // Schema guarantees
   // ----------------------------------------------------------------
-  await t.test('the database refuses a TOTP state the code cannot handle', async () => {
+  // This used to assert the opposite: a CHECK constraint pinned totp_enabled to
+  // false, because the login branch behind it returned 501 and flipping the
+  // column locked that admin out permanently. TOTP is implemented now, and the
+  // migration drops the constraint -- so the test that guarded the gap becomes
+  // the test that the gap is closed. See test/admin.test.js for the behaviour.
+  await t.test('the database now permits an enabled TOTP account', async () => {
     const admin = await h.makeAdmin();
+    await h.query('UPDATE admins SET totp_enabled = true, totp_secret = $2 WHERE id = $1',
+      [admin.id, 'JBSWY3DPEHPK3PXP']);
+    const { rows } = await h.query('SELECT totp_enabled FROM admins WHERE id = $1', [admin.id]);
+    assert.equal(rows[0].totp_enabled, true);
+  });
+
+  // CI applies schema.sql twice, but against an empty database -- which is the
+  // one state that cannot catch this. The failure it missed: an earlier
+  // section added a CHECK pinning totp_enabled to false and a later one
+  // dropped it, so the file ended in the right state and was re-runnable
+  // exactly once. The second run's ADD executed against a database where an
+  // admin had since enrolled, failed, and took every statement after it down
+  // with it -- meaning `npm run migrate` stopped working on the day someone
+  // turned on two-factor, and the next deploy was what found out.
+  //
+  // So this re-applies the schema over rows that exist, which is what every
+  // upgrade after the first one actually does.
+  await t.test('schema.sql re-applies over live data, including an enrolled admin', async () => {
+    await h.makeAdmin({ email: 'enrolled@example.com', totpSecret: 'JBSWY3DPEHPK3PXP' });
+    await h.makeGrant({ email: 'someone@example.com', status: 'ACTIVE' });
+
+    const schema = fs.readFileSync(path.join(__dirname, '..', 'schema.sql'), 'utf8');
+    await h.query(schema);
+    await h.query(schema);
+
+    const { rows } = await h.query(
+      "SELECT totp_enabled, role FROM admins WHERE email = 'enrolled@example.com'"
+    );
+    assert.equal(rows[0].totp_enabled, true, 'the migration must not undo an enrolment');
+    assert.equal(rows[0].role, 'owner');
+  });
+
+  await t.test('every admin row carries a role the application recognises', async () => {
+    const admin = await h.makeAdmin({ role: 'auditor' });
+    assert.equal(admin.role, 'auditor');
     await assert.rejects(
-      () => h.query('UPDATE admins SET totp_enabled = true WHERE id = $1', [admin.id]),
-      /admins_totp_not_implemented/
+      () => h.query('UPDATE admins SET role = $2 WHERE id = $1', [admin.id, 'superuser']),
+      /admins_role_valid/
     );
   });
 

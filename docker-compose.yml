@@ -1,0 +1,174 @@
+# A whole working system on one machine: Postgres, the gateway, and a
+# stand-in for the internal app it protects.
+#
+#   docker compose up --build
+#   docker compose logs bootstrap     # the admin password, printed once
+#
+# This is a DEMO stack. It ships with a known JWT_SECRET and a database
+# password of `temp_access`, both fine on a laptop and both disqualifying in
+# production -- DEPLOY.md is the runbook for a real deployment, where the
+# gateway runs under systemd against managed Postgres and nginx terminates
+# TLS. Anything below marked DEMO ONLY is the difference between the two.
+
+name: temp-access
+
+# One image, three roles. Without the shared `image:` name compose builds the
+# same Dockerfile once per service and tags three copies of it.
+x-app: &app
+  build: .
+  image: temp-access:local
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: temp_access
+      POSTGRES_PASSWORD: temp_access   # DEMO ONLY
+      POSTGRES_DB: temp_access
+    # Nothing outside the compose network needs Postgres, so the port is not
+    # published. Add `ports: ["5432:5432"]` if you want to inspect it with a
+    # local client.
+    healthcheck:
+      # `-U` matters: pg_isready defaults to the OS user (root here) and
+      # reports "no response" for what is really a missing role.
+      test: ["CMD-SHELL", "pg_isready -U temp_access -d temp_access"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+  # Applies schema.sql and creates the admin account, then exits. The gateway
+  # waits for it to finish successfully, so the first request already has a
+  # database with tables in it and someone who can sign in -- rather than the
+  # two-step failure of an empty schema surfacing as a 500 and an empty admins
+  # table surfacing as a wrong password.
+  bootstrap:
+    <<: *app
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://temp_access:temp_access@db:5432/temp_access
+      ADMIN_EMAIL: ${DEMO_ADMIN_EMAIL:-admin@example.com}
+      # Unset by default, which leaves --generate to invent one and print it.
+      # Set DEMO_ADMIN_PASSWORD in a .env beside this file to choose your own.
+      ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+    command: >
+      sh -c "node scripts/migrate.js --wait &&
+             node scripts/create-admin.js --generate --force"
+
+  # Stands in for the VPN-hosted application. Deliberately published on 4001
+  # so the demo can show what happens when someone goes around the gateway:
+  # it answers `Direct access is not permitted.` because it requires the
+  # shared-secret header the gateway adds. In a real deployment this app is
+  # not published at all -- the firewall is the primary control and the header
+  # is the backstop.
+  demo-app:
+    <<: *app
+    restart: unless-stopped
+    command: ["node", "demo-app/app.js"]
+    environment:
+      DEMO_PORT: 4000
+      # Loopback is the default, which would hide it from the gateway
+      # container as well. See the comment where this is read.
+      DEMO_HOST: 0.0.0.0
+      GATEWAY_SECRET: ${UPSTREAM_SHARED_SECRET:-demo-upstream-shared-secret}
+    ports:
+      - "${DEMO_APP_PORT:-4001}:4000"
+    healthcheck:
+      # Overrides the image's, which probes the gateway's port and path. This
+      # role is a different app on 4000, and with GATEWAY_SECRET set it answers
+      # 403 to anything without the header -- so a 403 is a healthy answer here
+      # and "responded at all" is the whole signal.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/').then(()=>process.exit(0)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  gateway:
+    <<: *app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+      demo-app:
+        condition: service_started
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgres://temp_access:temp_access@db:5432/temp_access
+      # DEMO ONLY. Generate a real one per environment:
+      #   node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+      JWT_SECRET: ${JWT_SECRET:-demo-only-jwt-secret-not-for-production-use}
+      # What the browser types, not what the container calls itself: every
+      # emailed access link is built from this, so `gateway:3000` here would
+      # ship links that only resolve inside the compose network. Set it to the
+      # real https:// hostname when this is behind a TLS proxy -- that is also
+      # what puts the Secure flag on the session cookie.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:3000}
+      UPSTREAM_URL: http://demo-app:4000
+      UPSTREAM_SHARED_SECRET: ${UPSTREAM_SHARED_SECRET:-demo-upstream-shared-secret}
+      # No proxy in front of this stack by default, so X-Forwarded-For is
+      # whatever the client sent and trusting it would let any caller spoof its
+      # address in the audit log and dodge the rate limits. Put nginx or Caddy
+      # in front (DEPLOY.md §6) and set TRUST_PROXY=true together, never one
+      # without the other.
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+      # Inferred from an https:// PUBLIC_BASE_URL, so this only matters for the
+      # plain-HTTP localhost case. DEMO ONLY, like the absence of TLS itself.
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      # Empty means the admin console answers anyone who can reach the port,
+      # which is the right default for a laptop and the wrong one everywhere
+      # else. Scope it to a VPN or office range: ADMIN_IP_ALLOWLIST=10.8.0.0/24
+      ADMIN_IP_ALLOWLIST: ${ADMIN_IP_ALLOWLIST:-}
+      SESSION_TTL_SECONDS: 3600
+      MAX_DURATION_HOURS: ${MAX_DURATION_HOURS:-24}
+      PENDING_EXPIRY_HOURS: ${PENDING_EXPIRY_HOURS:-24}
+      # Email is optional and off by default: with no key the grant is still
+      # created and the admin console shows the password on screen, which is
+      # what makes the demo work with no third-party account at all. Fill
+      # these in to watch a real email arrive.
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-onboarding@resend.dev}
+      # Off in the demo so the walkthrough is not a detour through an
+      # authenticator app. Turn it on in production -- an admin password is the
+      # credential that mints access to the internal network.
+      ADMIN_REQUIRE_TOTP: ${ADMIN_REQUIRE_TOTP:-false}
+      # Likewise off, so the demo can issue a grant with one field filled in.
+      REQUIRE_GRANT_REASON: ${REQUIRE_GRANT_REASON:-false}
+      # pretty, because the point of the demo is `docker compose logs` being
+      # readable. Unset in production and it defaults to json, which is what a
+      # collector wants.
+      LOG_FORMAT: ${LOG_FORMAT:-pretty}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Set both to watch the event feed: any URL that answers 2xx will do.
+      #   WEBHOOK_URL=https://your-siem.example/hooks/access
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:-}
+      # Scrape target at /__access/metrics. Blank means 404, which is the
+      # default so the demo does not publish its own telemetry unasked.
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+    # Takes a bind address as well as a port: GATEWAY_PORT=127.0.0.1:3000
+    # publishes on loopback only, which is what you want with a TLS proxy in
+    # front -- otherwise Docker publishes on every interface and answers plain
+    # HTTP there, past a firewall rule the daemon may have opened for you.
+    ports:
+      - "${GATEWAY_PORT:-3000}:3000"
+    healthcheck:
+      # Readiness rather than liveness: this gates depends_on, which is a
+      # question about whether the gateway can actually serve, and readiness is
+      # the probe that includes Postgres.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/__access/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  db-data:

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 //
-// Prunes audit_log rows older than the retention window.
+// Prunes audit_log rows older than the retention window, and the delivered
+// webhook rows that have no reason to outlive them.
 //
 //   npm run prune-audit                 (uses AUDIT_RETENTION_MONTHS, default 12)
 //   npm run prune-audit -- --months=6
@@ -86,6 +87,22 @@ const pool = new Pool({
     );
 
     console.log(`deleted   : ${deleted} row${deleted === 1 ? '' : 's'}`);
+
+    // webhook_outbox is a queue that keeps its history, so on a healthy system
+    // it grows by one DELIVERED row per audited event, forever. Only the
+    // delivered ones are swept: a FAILED row is a security event that was
+    // never handed to the consumer, and that is exactly what somebody will
+    // want to find later.
+    //
+    // A shorter window than the audit log, because the audit table is the
+    // record and this is only the delivery receipt for it.
+    const outboxDays = Number(process.env.WEBHOOK_RETENTION_DAYS || 30);
+    const { rowCount: outbox } = await pool.query(
+      `DELETE FROM webhook_outbox
+        WHERE status = 'DELIVERED' AND delivered_at < now() - ($1 || ' days')::interval`,
+      [String(outboxDays)]
+    );
+    if (outbox) console.log(`webhooks  : ${outbox} delivered row${outbox === 1 ? '' : 's'} removed`);
   } catch (err) {
     console.error(`Failed: ${err.message}`);
     process.exitCode = 1;
