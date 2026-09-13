@@ -967,4 +967,31 @@ test('gateway', { skip: h.skip, concurrency: 1 }, async (t) => {
       "SELECT must_change_password FROM admins WHERE email = 'cli-admin@example.com'"));
     assert.equal(rows[0].must_change_password, true, 'a CLI reset must force a change too');
   });
+
+  // ----------------------------------------------------------------
+  // The injected banner
+  // ----------------------------------------------------------------
+  // The banner is JavaScript assembled inside a template string in server.js,
+  // so a syntax slip there passes every other test and only fails in a
+  // browser -- silently, since the page still renders. Parsing the script the
+  // gateway actually injects is what catches it.
+  await t.test('the injected banner script parses and re-syncs quickly', async () => {
+    await h.makeGrant({ email: 'banner@example.com', password: 'banner-pass' });
+    const c = h.client();
+    await c.json('/__access/api/auth/login', { email: 'banner@example.com', password: 'banner-pass' });
+
+    const res = await c('/', { headers: HTML });
+    const body = await res.text();
+    const script = [...body.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/gi)]
+      .map((m) => m[1])
+      .find((code) => code.includes('ta-banner'));
+
+    assert.ok(script, 'the banner script should be injected');
+    assert.doesNotThrow(() => new Function(script), 'the banner script must be valid JavaScript');
+    // A revoke has to show on screen within seconds, not at the next minute.
+    assert.match(script, /setInterval\(sync, 10000\)/);
+    assert.match(script, /visibilitychange/);
+    // A dropped request must not end the session; only a refusal does.
+    assert.match(script, /r\.status === 401/);
+  });
 });

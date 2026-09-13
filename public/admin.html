@@ -558,7 +558,10 @@
         showError('Revoke failed.');
         return;
       }
-      await loadGrants();
+      // The server has already cut the session off. Say so now, rather than
+      // after the list reloads, which is a second round trip.
+      btn.textContent = 'Revoked';
+      loadGrants().catch(() => {});
     } catch (e) {
       if (e.message === 'unauthenticated') return;
       btn.disabled = false;

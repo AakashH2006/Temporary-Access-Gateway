@@ -332,6 +332,38 @@ async function sendViaResend({ to, subject, text, html }) {
   return res.json();
 }
 
+// Brevo, for a deployment with no domain to verify. Resend delivers only to its
+// own account holder until a domain is verified, and free hosts commonly block
+// outbound SMTP; Brevo's free plan sends from a single sender address confirmed
+// by an emailed link, over HTTPS. EMAIL_FROM may carry a display name
+// ("Acme Access <access@acme.com>"); the address has to be the verified one.
+function parseSender(from) {
+  const fallbackName = process.env.EMAIL_FROM_NAME || 'Temporary Access';
+  const match = /^\s*(.*?)\s*<([^>]+)>\s*$/.exec(from || '');
+  if (match) return { name: match[1] || fallbackName, email: match[2].trim() };
+  return { name: fallbackName, email: String(from || '').trim() };
+}
+
+async function sendViaBrevo({ to, subject, text, html }) {
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'api-key': process.env.BREVO_API_KEY,
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({
+      sender: parseSender(process.env.EMAIL_FROM),
+      to: [{ email: to }],
+      subject,
+      textContent: text,
+      htmlContent: html,
+    }),
+  });
+  if (!res.ok) throw new Error(`Email send failed: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+
 // SigV4, signed by hand rather than pulling in the AWS SDK. One request to one
 // endpoint does not justify ~20MB of dependency, and the signing steps below
 // are the whole of what the SDK would do for this call.
@@ -413,25 +445,34 @@ function resolveEmailProvider() {
     missing: SES_KEYS.filter((k) => !process.env[k]).join(', '),
   };
 
+  const brevo = {
+    name: 'brevo',
+    send: sendViaBrevo,
+    ready: Boolean(process.env.BREVO_API_KEY),
+    missing: 'BREVO_API_KEY',
+  };
+
   const named = (process.env.EMAIL_PROVIDER || '').trim().toLowerCase();
   if (named === 'resend') return resend;
   if (named === 'ses') return ses;
+  if (named === 'brevo') return brevo;
   if (named) {
     return {
       name: named,
       send: null,
       ready: false,
-      missing: `EMAIL_PROVIDER="${named}" is not a known provider (use "resend" or "ses")`,
+      missing: `EMAIL_PROVIDER="${named}" is not a known provider (use "resend", "ses" or "brevo")`,
     };
   }
 
   if (resend.ready) return resend;
   if (ses.ready) return ses;
+  if (brevo.ready) return brevo;
   return {
     name: 'none',
     send: null,
     ready: false,
-    missing: 'RESEND_API_KEY, or all of ' + SES_KEYS.join(', '),
+    missing: 'RESEND_API_KEY, BREVO_API_KEY, or all of ' + SES_KEYS.join(', '),
   };
 }
 
@@ -2530,25 +2571,41 @@ function bannerScript(nonce) {
     return (h<10?'0':'')+h+':'+(m<10?'0':'')+m+':'+(x<10?'0':'')+x;
   }
 
-  var left = 0;
+  // null until the first sync answers. Starting at 0 meant a first request
+  // slower than a second -- a free host waking up -- read as "time's up" and
+  // sent the customer to the login page with time still on the clock.
+  var left = null;
   function paint(){
+    if (left === null) return;
     bar.querySelector('.t').textContent = fmt(Math.max(0,left));
     bar.className = left < 300 ? 'warn' : '';
-    if (left <= 0) { location.href = '${GATE}/login'; return; }
+    if (left <= 0) { location.href = '${GATE}/login?reason=expired'; return; }
     left--;
   }
   // Re-sync against the server rather than trusting the local clock: the
-  // countdown is a courtesy, the server is the authority. This also notices
-  // an admin revoke within a minute.
+  // countdown is a courtesy, the server is the authority. Every 10 seconds,
+  // and at once when the tab comes back into view, so an admin revoke shows on
+  // screen within seconds rather than at the next minute. Only a refusal from
+  // the server ends the session here: a request dropped by a flaky connection
+  // is retried on the next tick instead of throwing the customer out.
   function sync(){
     fetch('${GATE}/api/session', { credentials: 'same-origin' })
-      .then(function(r){ if(!r.ok) throw 0; return r.json(); })
-      .then(function(d){ left = d.remainingSeconds; })
-      .catch(function(){ location.href = '${GATE}/login'; });
+      .then(function(r){
+        if (r.status === 401 || r.status === 403) {
+          return r.json().catch(function(){ return {}; }).then(function(d){
+            location.href = '${GATE}/login' + (d.reason ? '?reason=' + encodeURIComponent(d.reason) : '');
+          });
+        }
+        if (!r.ok) return;
+        return r.json().then(function(d){ left = d.remainingSeconds; });
+      })
+      .catch(function(){});
   }
   sync();
   setInterval(paint, 1000);
-  setInterval(sync, 60000);
+  setInterval(sync, 10000);
+  document.addEventListener('visibilitychange', function(){ if (!document.hidden) sync(); });
+  window.addEventListener('focus', sync);
 })();</script>`;
 }
 
@@ -3083,6 +3140,7 @@ module.exports = {
   relaxCspForBanner,
   renderAccessEmail,
   resolveEmailProvider,
+  sendViaBrevo,
   csvField,
   auditFilters,
   // The webhook outbox and the gauges are driven by the same timer as the

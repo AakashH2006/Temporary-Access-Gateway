@@ -21,6 +21,7 @@ const {
   relaxCspForBanner,
   renderAccessEmail,
   resolveEmailProvider,
+  sendViaBrevo,
 } = require('../server.js');
 
 test('normaliseEmail lower-cases and trims', () => {
@@ -157,10 +158,57 @@ test('renderAccessEmail states both clocks', () => {
   }
 });
 
+test('sendViaBrevo posts the shape Brevo expects, with the key only in a header', async () => {
+  const keys = ['BREVO_API_KEY', 'EMAIL_FROM', 'EMAIL_FROM_NAME'];
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  const realFetch = global.fetch;
+  let seen;
+  try {
+    process.env.BREVO_API_KEY = 'xkeysib-test';
+    process.env.EMAIL_FROM = 'Acme Access <access@example.com>';
+    delete process.env.EMAIL_FROM_NAME;
+    global.fetch = async (url, opts) => {
+      seen = { url, opts };
+      return new Response(JSON.stringify({ messageId: '<x@relay>' }), { status: 201 });
+    };
+
+    await sendViaBrevo({ to: 'vendor@example.com', subject: 'S', text: 'T', html: '<p>H</p>' });
+    assert.equal(seen.url, 'https://api.brevo.com/v3/smtp/email');
+    assert.equal(seen.opts.method, 'POST');
+    assert.equal(seen.opts.headers['api-key'], 'xkeysib-test');
+    const body = JSON.parse(seen.opts.body);
+    assert.deepEqual(body.sender, { name: 'Acme Access', email: 'access@example.com' });
+    assert.deepEqual(body.to, [{ email: 'vendor@example.com' }]);
+    assert.equal(body.subject, 'S');
+    assert.equal(body.textContent, 'T');
+    assert.equal(body.htmlContent, '<p>H</p>');
+    assert.equal(seen.opts.body.includes('xkeysib-test'), false, 'the key must never be in the body');
+
+    // A bare address gets a default display name, and a refusal from Brevo --
+    // an unverified sender, say -- surfaces with its status instead of passing
+    // for a sent email.
+    process.env.EMAIL_FROM = 'access@example.com';
+    global.fetch = async (url, opts) => {
+      seen = { url, opts };
+      return new Response('{"message":"sender not valid"}', { status: 400 });
+    };
+    await assert.rejects(
+      () => sendViaBrevo({ to: 'v@example.com', subject: 'S', text: 'T', html: 'H' }),
+      /400/
+    );
+    assert.deepEqual(JSON.parse(seen.opts.body).sender, { name: 'Temporary Access', email: 'access@example.com' });
+  } finally {
+    global.fetch = realFetch;
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
 test('resolveEmailProvider picks a backend and reports what is missing', () => {
   const saved = { ...process.env };
   const clear = () => {
-    for (const k of ['EMAIL_PROVIDER', 'RESEND_API_KEY', 'SES_REGION',
+    for (const k of ['EMAIL_PROVIDER', 'RESEND_API_KEY', 'BREVO_API_KEY', 'SES_REGION',
       'SES_ACCESS_KEY_ID', 'SES_SECRET_ACCESS_KEY']) delete process.env[k];
   };
 
@@ -175,6 +223,14 @@ test('resolveEmailProvider picks a backend and reports what is missing', () => {
     process.env.RESEND_API_KEY = 're_test';
     assert.equal(resolveEmailProvider().name, 'resend');
     assert.equal(resolveEmailProvider().ready, true);
+
+    // Brevo is inferred from its key, and can be named explicitly.
+    clear();
+    process.env.BREVO_API_KEY = 'xkeysib-test';
+    assert.equal(resolveEmailProvider().name, 'brevo');
+    assert.equal(resolveEmailProvider().ready, true);
+    process.env.EMAIL_PROVIDER = 'brevo';
+    assert.equal(resolveEmailProvider().name, 'brevo');
 
     clear();
     Object.assign(process.env, {
