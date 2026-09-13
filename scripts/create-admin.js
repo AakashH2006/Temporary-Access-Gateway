@@ -79,7 +79,7 @@ if (!process.env.DATABASE_URL) {
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  ssl: require('../lib/db-ssl')(),
 });
 
 // Answers are read differently depending on whether a human is typing.
@@ -200,11 +200,20 @@ async function ask(question, { silent = false } = {}) {
     // This script's other job is password recovery, and silently promoting an
     // auditor back to owner because the flag defaults that way is not a
     // recovery -- it is a privilege escalation with a friendly message.
+    //
+    // must_change_password is set on both branches, and this script is the
+    // reason the column exists: a password typed on a terminal and read out
+    // over some other channel should not stay valid for the life of the
+    // account. Leaving it unset here -- which is what used to happen -- meant
+    // the one path it was written for was the one path that skipped it, on
+    // every first admin of every deployment and every recovery since.
     const { rows } = await pool.query(
-      `INSERT INTO admins (email, password_hash, role) VALUES ($1, $2, $3)
+      `INSERT INTO admins (email, password_hash, role, must_change_password)
+       VALUES ($1, $2, $3, true)
        ON CONFLICT (email) DO UPDATE
          SET password_hash = EXCLUDED.password_hash,
              role = CASE WHEN $4 THEN EXCLUDED.role ELSE admins.role END,
+             must_change_password = true,
              failed_login_attempts = 0,
              locked_until = NULL,
              disabled_at = NULL

@@ -1,8 +1,8 @@
 # Temporary Access Gateway
 
-Lets a customer who has **no VPN credentials** reach a VPN-hosted application
-for a window of time an admin decides — through a browser, with nothing to
-install.
+Lets an outside vendor who has **no VPN credentials** reach a VPN-hosted
+application for a window of time an admin decides — through a browser, with
+nothing to install.
 
 ![The whole lifecycle: an admin issues a one-hour grant, the customer activates
 the link and logs in, reaches the internal app with a countdown bar, and is cut
@@ -22,6 +22,31 @@ An admin enters an email and a duration. The system emails a one-time link and
 a temporary password. Opening the link starts the clock. From then until the
 window closes, that person's browser reaches the internal app through this
 gateway, and the gateway re-checks their authorization on every single request.
+
+## Who this is for
+
+**Outside vendors, not employees.**
+
+This exists for people who do not work for you and never will have a place in
+your directory: a vendor's support engineer reproducing a bug in the live app,
+an auditor who needs four hours in one system, an integration partner during a
+cutover. They have no VPN client, no account in your identity provider, and no
+reason to be issued either for a job that lasts an afternoon.
+
+**Employees keep using the VPN.** Nothing here replaces it, competes with it,
+or sits in front of it. Staff access is already solved inside your network — a
+permanent identity, a directory that owns it, and a VPN that enforces it.
+Routing that through a gateway built for people who have no identity at all
+would be a downgrade in every direction.
+
+The distinction is the whole design. Everything this does cheaply — issue in
+seconds, expire on a clock, revoke mid-session, leave a per-person audit trail
+— is cheap precisely because a grant is disposable and owns nothing. That is
+the right trade for a two-day vendor engagement and the wrong one for someone
+who shows up every morning.
+
+Throughout this document **"the customer"** means the outside party receiving
+access, not a customer of yours in the commercial sense.
 
 ## How it works
 
@@ -53,7 +78,7 @@ names.
 ADMIN                     GATEWAY                       CUSTOMER
   │                         │                             │
   ├─ email + duration ──────▶                             │
-  │                         ├─ 9-digit token + password    │
+  │                         ├─ link token + password       │
   │                         ├─ create PENDING grant        │
   │                         ├─ email link + password ──────▶
   │                         │                             ├─ opens the link
@@ -692,16 +717,21 @@ event.
   re-reading Postgres for every image would make the gateway the slowest thing
   in the stack. Logout and admin-revoke bust the cache directly, so revocation
   stays effectively instant.
-- **The session cookie is stripped before forwarding.** The upstream app never
-  sees it. It receives `X-Temp-Access-Email` and `X-Temp-Access-Grant` instead,
-  set unconditionally so a client cannot forge them.
+- **The session cookie is stripped from proxied HTTP requests** before
+  forwarding, so the upstream app never sees it. Those requests carry
+  `X-Temp-Access-Email` and `X-Temp-Access-Grant` instead, set unconditionally
+  on the way through so a client cannot forge them. Websocket upgrades get
+  exactly the same treatment, through the same function.
 - **A countdown bar is injected into the app's HTML pages** so the customer can
   always see the time left and end the session from anywhere inside the app.
   Only documents are buffered for injection; assets stream untouched.
 - **Websocket upgrades are authorized separately**, since they bypass Express
-  middleware entirely.
-- **Token vs. password.** The 9-digit token is an identifier, SHA-256 hashed
-  for lookup. The password is a real credential, bcrypt cost 12.
+  middleware entirely. The session is resolved before the socket is handed
+  to the proxy, and tests cover the refusals — no session, a revoked grant —
+  as well as the header hygiene on an upgrade that is allowed through.
+- **Token vs. password.** The link token is 256 random bits, SHA-256 hashed
+  for lookup; nobody types it, so its length costs the customer nothing. The
+  password is a real credential, bcrypt cost 12.
 - **Email is accepted, not delivered.** A provider returning `200` means it
   took the message, not that anyone received it. The audit event is
   `GRANT_EMAIL_ACCEPTED` and the console says *accepted for delivery*, because
@@ -795,6 +825,11 @@ lockout is worse than a logged anomaly.
 Also out of scope, and worth saying plainly rather than leaving to be
 discovered:
 
+- **Employee or staff access.** This is not a VPN replacement and not an
+  identity provider. Employees have permanent identities that a directory
+  owns; this issues disposable ones that expire. Pointing it at your own
+  workforce would mean re-issuing links to the same people forever, with no
+  directory behind them — see [Who this is for](#who-this-is-for).
 - **Multi-instance / horizontal scaling** — see the constraint above. The
   webhook outbox is already safe to drain from several processes, and the
   grant-status cache is bounded by a short TTL, but the rate limiters are

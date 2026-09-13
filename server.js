@@ -53,6 +53,11 @@ const UPSTREAM_URL = process.env.UPSTREAM_URL;
 const COOKIE_NAME = 'ta_session';
 const COOKIE_SECURE = process.env.COOKIE_SECURE === 'true'
   || process.env.PUBLIC_BASE_URL.startsWith('https://');
+// Named once and pinned on both sign and verify. jsonwebtoken already refuses
+// `alg: none` for a symmetric secret, so this changes nothing today -- it is
+// here so that a future version relaxing that default, or a key that stops
+// being symmetric, cannot quietly turn "signed" into "claims to be signed".
+const JWT_ALG = 'HS256';
 // Three independent clocks, and conflating any two of them produces a bug
 // that is very hard to see from a support ticket:
 //
@@ -158,10 +163,25 @@ const ADMIN_IP_ALLOWLIST = (process.env.ADMIN_IP_ALLOWLIST || '')
     }
   });
 
+// Managed Postgres (Neon/Supabase/RDS) requires TLS; a local socket does not.
+// Certificate verification, and its one explicit escape hatch, live in
+// lib/db-ssl.js so the scripts cannot drift from the gateway.
+const databaseSsl = require('./lib/db-ssl');
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  // Managed Postgres (Neon/Supabase/RDS) requires TLS; a local socket does not.
-  ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
+  ssl: databaseSsl(),
+  // Without a connection timeout, a query against a Postgres that accepts TCP
+  // but never answers hangs forever -- and the readiness probe below hangs
+  // with it, so the orchestrator sees no answer instead of the 503 that would
+  // take this instance out of rotation. A slow failure is worse than a fast
+  // one here, because only the fast one is actionable.
+  connectionTimeoutMillis: Number(process.env.DB_CONNECT_TIMEOUT_MS || 5000),
+  idleTimeoutMillis: Number(process.env.DB_IDLE_TIMEOUT_MS || 30_000),
+  max: Number(process.env.DB_POOL_MAX || 10),
+  // Caps a single statement rather than the pool: one pathological audit-log
+  // query should not hold a connection the proxy hot path needs.
+  statement_timeout: Number(process.env.DB_STATEMENT_TIMEOUT_MS || 15_000),
 });
 
 // `pg` emits 'error' on idle clients when a connection drops -- a Postgres
@@ -177,8 +197,17 @@ pool.on('error', (err) => {
 // ============================================================
 // Crypto helpers
 // ============================================================
+// 256 bits of base64url, the sole bearer secret in the emailed link.
+//
+// This was nine decimal digits -- about 30 bits, and stored as an unsalted
+// SHA-256, so anyone who read the database could recover every live token by
+// exhausting the space in seconds. Nobody types this value: it is clicked, so
+// a longer one costs the customer nothing. The character class is url-safe by
+// construction, which is what keeps the route guards below simple.
+const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+
 function generateToken() {
-  return String(crypto.randomInt(100000000, 1000000000));
+  return crypto.randomBytes(32).toString('base64url');
 }
 function hashToken(token) {
   return crypto.createHash('sha256').update(token).digest('hex');
@@ -188,9 +217,20 @@ function generatePassword(length = 16) {
   // screen and retyped by hand, so transcription errors are the failure mode
   // actually worth designing against.
   const charset = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789';
-  const bytes = crypto.randomBytes(length);
+  // Rejection sampling rather than `% charset.length`. 256 is not a multiple
+  // of 57, so the modulo would make the first 28 glyphs a fifth likelier than
+  // the rest. It costs a handful of bits out of ninety-odd and would never be
+  // the way in -- but a generator with a known skew is the kind of thing that
+  // has to be explained in a security review, and not having it is free.
+  const limit = 256 - (256 % charset.length);
   let out = '';
-  for (let i = 0; i < length; i++) out += charset[bytes[i] % charset.length];
+  while (out.length < length) {
+    for (const byte of crypto.randomBytes(length)) {
+      if (byte >= limit) continue;
+      out += charset[byte % charset.length];
+      if (out.length === length) break;
+    }
+  }
   return out;
 }
 async function hashPassword(password) {
@@ -514,7 +554,7 @@ async function resolveSession(req) {
   let payload;
   let sessionLapsed = false;
   try {
-    payload = jwt.verify(token, process.env.JWT_SECRET);
+    payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: [JWT_ALG] });
   } catch (err) {
     if (err.name !== 'TokenExpiredError') return { ok: false, reason: 'bad_token' };
     // The session is capped at the grant's expiry, so when a window closes
@@ -524,7 +564,10 @@ async function resolveSession(req) {
     // signature still enforced, purely to name the reason accurately -- the
     // grant lookup below remains the thing that actually decides access.
     try {
-      payload = jwt.verify(token, process.env.JWT_SECRET, { ignoreExpiration: true });
+      payload = jwt.verify(token, process.env.JWT_SECRET, {
+        algorithms: [JWT_ALG],
+        ignoreExpiration: true,
+      });
       sessionLapsed = true;
     } catch {
       return { ok: false, reason: 'bad_token' };
@@ -623,7 +666,7 @@ async function requireAdminSession(req, res, next) {
 
   let payload;
   try {
-    payload = jwt.verify(token, ADMIN_JWT_KEY);
+    payload = jwt.verify(token, ADMIN_JWT_KEY, { algorithms: [JWT_ALG] });
   } catch {
     res.clearCookie(ADMIN_COOKIE_NAME, adminCookieOptions());
     return res.status(401).json({ error: 'Admin session invalid or expired' });
@@ -853,7 +896,19 @@ app.use(GATE, gateLimiter);
 // Static assets for the gate's own pages only. The previous build served
 // __dirname, which published server.js, schema.sql and package.json to
 // anyone who asked for them.
-app.use(GATE, express.static(path.join(__dirname, 'public'), { dotfiles: 'deny' }));
+//
+// `index: false` and the extension filter matter as much as the directory
+// does: serving public/ wholesale also served admin.html and admin-login.html
+// at their own filenames, which reach the same markup as the routes below
+// without passing the IP allowlist those routes are wrapped in. Assets are
+// public by nature; the console's markup is not.
+const gateStatic = express.static(path.join(__dirname, 'public'), {
+  dotfiles: 'deny',
+  index: false,
+});
+app.use(GATE, (req, res, next) =>
+  /\.html?$/i.test(req.path) ? next() : gateStatic(req, res, next)
+);
 
 const page = (name) => (_req, res) => res.sendFile(path.join(__dirname, 'public', name));
 app.get(`${GATE}/login`, page('login.html'));
@@ -916,7 +971,7 @@ app.get(`${GATE}/metrics`, (req, res) => {
 
 // The link in the access email points here.
 app.get(`${GATE}/link/:token`, (req, res) => {
-  if (!/^\d{9}$/.test(req.params.token)) return res.status(404).send('Invalid access link');
+  if (!TOKEN_RE.test(req.params.token)) return res.status(404).send('Invalid access link');
   res.sendFile(path.join(__dirname, 'public', 'activate.html'));
 });
 
@@ -974,14 +1029,27 @@ app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, as
   // otherwise an attacker holding a valid password gets unlimited guesses at
   // six digits, and the second factor is worth nothing.
   const countFailure = async () => {
-    const attempts = admin.failed_login_attempts + 1;
-    const lock = attempts >= ADMIN_MAX_FAILED_ATTEMPTS;
-    await pool.query(
-      `UPDATE admins SET failed_login_attempts = $1,
-              locked_until = CASE WHEN $2 THEN now() + ($3 || ' minutes')::interval ELSE locked_until END
-       WHERE id = $4`,
-      [lock ? 0 : attempts, lock, String(ADMIN_LOCKOUT_MINUTES), admin.id]
+    // Incremented in the statement rather than read, added to, and written
+    // back: guesses arriving together all read the same value under a
+    // read-modify-write, so a parallel attacker records one attempt per round
+    // instead of one per guess -- which is the lockout not working in exactly
+    // the case it exists for. Postgres decides whether this attempt is the one
+    // that locks, and says so in RETURNING.
+    const { rows } = await pool.query(
+      `UPDATE admins
+          SET failed_login_attempts =
+                CASE WHEN failed_login_attempts + 1 >= $1 THEN 0
+                     ELSE failed_login_attempts + 1 END,
+              locked_until =
+                CASE WHEN failed_login_attempts + 1 >= $1
+                     THEN now() + ($2 || ' minutes')::interval
+                     ELSE locked_until END
+        WHERE id = $3
+       RETURNING failed_login_attempts, locked_until`,
+      [ADMIN_MAX_FAILED_ATTEMPTS, String(ADMIN_LOCKOUT_MINUTES), admin.id]
     );
+    // The counter resets to 0 as it locks, so 0 is how a lock reports itself.
+    const lock = rows[0]?.failed_login_attempts === 0;
     if (lock) {
       await audit(req, {
         event: 'ADMIN_LOCKED',
@@ -1093,7 +1161,7 @@ app.post(`${GATE}/api/admin/auth/login`, adminIpAllowlist, adminLoginLimiter, as
   const token = jwt.sign(
     { adminId: admin.id, email: admin.email, typ: 'admin' },
     ADMIN_JWT_KEY,
-    { expiresIn: ADMIN_SESSION_TTL_SECONDS }
+    { algorithm: JWT_ALG, expiresIn: ADMIN_SESSION_TTL_SECONDS }
   );
 
   await audit(req, {
@@ -2137,7 +2205,7 @@ app.get(`${GATE}/api/admin/audit-log.csv`, adminOnly, async (req, res) => {
 // Gate API -- activation, login, session
 // ============================================================
 app.get(`${GATE}/api/activate/:token`, activateLimiter, async (req, res) => {
-  if (!/^\d{9}$/.test(req.params.token)) {
+  if (!TOKEN_RE.test(req.params.token)) {
     return res.status(404).json({ error: 'Invalid or expired access link' });
   }
 
@@ -2298,14 +2366,29 @@ app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
     // like a control during a security review and was not one. It locks now,
     // mirroring the admin path -- persisted in Postgres so it survives a
     // restart, where the per-IP limiter (in memory, per process) does not.
-    const attempts = grant.failed_login_attempts + 1;
-    const lock = attempts >= GRANT_MAX_FAILED_ATTEMPTS;
-    await pool.query(
-      `UPDATE access_grants SET failed_login_attempts = $1,
-              locked_until = CASE WHEN $2 THEN now() + ($3 || ' minutes')::interval ELSE locked_until END
-       WHERE id = $4`,
-      [lock ? 0 : attempts, lock, String(GRANT_LOCKOUT_MINUTES), grant.id]
+    //
+    // Incremented in the statement rather than read, added to, and written
+    // back. Under a read-modify-write, guesses arriving together all read the
+    // same starting value and all write the same result, so a parallel
+    // attacker is charged one attempt per round instead of one per guess --
+    // the lockout failing in precisely the case it exists for.
+    const { rows: locked } = await pool.query(
+      `UPDATE access_grants
+          SET failed_login_attempts =
+                CASE WHEN failed_login_attempts + 1 >= $1 THEN 0
+                     ELSE failed_login_attempts + 1 END,
+              locked_until =
+                CASE WHEN failed_login_attempts + 1 >= $1
+                     THEN now() + ($2 || ' minutes')::interval
+                     ELSE locked_until END
+        WHERE id = $3
+       RETURNING failed_login_attempts`,
+      [GRANT_MAX_FAILED_ATTEMPTS, String(GRANT_LOCKOUT_MINUTES), grant.id]
     );
+    // The counter resets to 0 as it locks, so 0 is how a lock reports itself;
+    // the audit line wants the attempt number a human would count to.
+    const lock = locked[0]?.failed_login_attempts === 0;
+    const attempts = lock ? GRANT_MAX_FAILED_ATTEMPTS : locked[0]?.failed_login_attempts;
     await audit(req, {
       grantId: grant.id,
       event: 'LOGIN_FAILED',
@@ -2337,7 +2420,7 @@ app.post(`${GATE}/api/auth/login`, loginLimiter, async (req, res) => {
   const sessionToken = jwt.sign(
     { grantId: grant.id, email: grant.email },
     process.env.JWT_SECRET,
-    { expiresIn: expiresInSeconds }
+    { algorithm: JWT_ALG, expiresIn: expiresInSeconds }
   );
 
   await pool.query(
@@ -2525,6 +2608,55 @@ function relaxCspForBanner(csp, nonce) {
   return out.join('; ');
 }
 
+// Hop-by-hop headers belong to a single connection and are ours to terminate
+// rather than relay (RFC 7230 6.1). `connection` and `upgrade` are deliberately
+// not in this list: the websocket handshake needs them, and http-proxy sets
+// both correctly on each path.
+const HOP_BY_HOP = [
+  'proxy-authorization',
+  'proxy-authenticate',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'keep-alive',
+];
+
+// Applied to everything leaving the gateway, over plain HTTP and over a
+// websocket upgrade alike. The two travel different paths through http-proxy
+// and fire different events, but they need identical treatment: the upstream
+// app decides who someone is from the headers set here, so any path that skips
+// this is a path where a client can name themselves.
+function applyGatewayHeaders(proxyReq, req) {
+  for (const header of HOP_BY_HOP) proxyReq.removeHeader(header);
+
+  // Never leak the gateway's own cookies to the upstream app. The admin cookie
+  // is already scoped to /__access and so should never be attached to a
+  // proxied request at all -- it is stripped here too because that is a
+  // browser honouring a Path attribute, not something this process enforces.
+  const cookie = req.headers.cookie;
+  if (cookie) {
+    const kept = cookie
+      .split(';')
+      .filter((c) => {
+        const name = c.trim().split('=')[0];
+        return name !== COOKIE_NAME && name !== ADMIN_COOKIE_NAME;
+      })
+      .join(';')
+      .trim();
+    if (kept) proxyReq.setHeader('cookie', kept);
+    else proxyReq.removeHeader('cookie');
+  }
+
+  // Tell the upstream app who this is. Set unconditionally (not merged)
+  // so a client cannot forge the claim by sending the header itself.
+  proxyReq.setHeader('X-Temp-Access-Email', req.session?.email || '');
+  proxyReq.setHeader('X-Temp-Access-Grant', req.session?.grantId || '');
+  // Proof that a request came through the gateway. Only useful if the app
+  // rejects requests without it -- see the integration step in DEPLOY.md.
+  // Set unconditionally for the same reason as the headers above.
+  if (UPSTREAM_SHARED_SECRET) proxyReq.setHeader(UPSTREAM_SECRET_HEADER, UPSTREAM_SHARED_SECRET);
+}
+
 const proxyCommon = {
   target: UPSTREAM_URL,
   changeOrigin: true,
@@ -2532,27 +2664,8 @@ const proxyCommon = {
   proxyTimeout: 30_000,
   timeout: 30_000,
   on: {
-    proxyReq: (proxyReq, req) => {
-      // Never leak the gateway's own session cookie to the upstream app.
-      const cookie = req.headers.cookie;
-      if (cookie) {
-        const kept = cookie
-          .split(';')
-          .filter((c) => c.trim().split('=')[0] !== COOKIE_NAME)
-          .join(';')
-          .trim();
-        if (kept) proxyReq.setHeader('cookie', kept);
-        else proxyReq.removeHeader('cookie');
-      }
-      // Tell the upstream app who this is. Set unconditionally (not merged)
-      // so a client cannot forge the claim by sending the header itself.
-      proxyReq.setHeader('X-Temp-Access-Email', req.session?.email || '');
-      proxyReq.setHeader('X-Temp-Access-Grant', req.session?.grantId || '');
-      // Proof that a request came through the gateway. Only useful if the app
-      // rejects requests without it -- see the integration step in DEPLOY.md.
-      // Set unconditionally for the same reason as the headers above.
-      if (UPSTREAM_SHARED_SECRET) proxyReq.setHeader(UPSTREAM_SECRET_HEADER, UPSTREAM_SHARED_SECRET);
-    },
+    proxyReq: applyGatewayHeaders,
+    proxyReqWs: applyGatewayHeaders,
     error: (err, req, res) => {
       metrics.counter('gateway_upstream_errors_total', { code: err.code || 'unknown' });
       (req?.log || log).error('proxy error', { err: err.message, code: err.code });
@@ -2567,7 +2680,14 @@ const proxyCommon = {
 // countdown banner can be injected; the raw one streams. Routing assets and
 // downloads through the buffering path would hold whole files in memory for
 // no benefit, since only documents can carry the banner.
-const proxyRaw = createProxyMiddleware({ ...proxyCommon, ws: true });
+// `ws: true` is deliberately absent. Setting it makes http-proxy-middleware
+// subscribe its own 'upgrade' listener to the HTTP server on the first proxied
+// request -- a listener that authorizes nothing and matches every path -- and
+// having done so, turns the `proxyRaw.upgrade()` call in startServer into a
+// silent no-op. The result is the opposite of what it looks like: the careful
+// handler stops working and the unauthenticated one does the proxying.
+// With the flag off, that handler stays the only route a socket has upstream.
+const proxyRaw = createProxyMiddleware({ ...proxyCommon });
 
 const proxyHtml = createProxyMiddleware({
   ...proxyCommon,
@@ -2835,6 +2955,7 @@ async function start({ handleSignals = false } = {}) {
     const s = app.listen(PORT, () => resolve(s));
   });
   const port = server.address().port;
+  const liveSockets = new Set();
 
   // Registered before anything is awaited: the socket is already accepting
   // connections, and an upgrade arriving in the meantime would otherwise be
@@ -2848,6 +2969,11 @@ async function start({ handleSignals = false } = {}) {
       const result = await resolveSession(req);
       if (!result.ok) return socket.destroy();
       req.session = result.session;
+      // Upgraded sockets leave the HTTP server's connection tracking, so
+      // server.close() would wait on them indefinitely. Kept here so shutdown
+      // can end them deliberately.
+      liveSockets.add(socket);
+      socket.on('close', () => liveSockets.delete(socket));
       proxyRaw.upgrade(req, socket, head);
     } catch {
       socket.destroy();
@@ -2895,8 +3021,16 @@ async function start({ handleSignals = false } = {}) {
   const sweepTimer = setInterval(tick, SWEEP_INTERVAL_MS);
   tick();
 
+  // A websocket is not a request that finishes; waiting for one to drain is
+  // waiting forever. Ending them lets close() complete, and a client that
+  // cares reconnects -- to this instance's replacement.
+  const endSockets = () => {
+    for (const socket of liveSockets) socket.destroy();
+  };
+
   const stop = async () => {
     clearInterval(sweepTimer);
+    endSockets();
     await new Promise((resolve) => server.close(resolve));
     await pool.end();
   };
@@ -2909,6 +3043,7 @@ async function start({ handleSignals = false } = {}) {
         // server.close() stops accepting and waits for in-flight requests. On a
         // proxy that is not a formality: a customer mid-upload should finish,
         // not get a truncated response because a deploy landed.
+        endSockets();
         server.close(() => pool.end().then(() => process.exit(0)));
         // The deadline is shorter than the orchestrator's own grace period
         // (Docker and Kubernetes both default to 30s), so this process is what
