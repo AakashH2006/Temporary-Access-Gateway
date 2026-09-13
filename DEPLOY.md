@@ -639,8 +639,10 @@ DATABASE_URL='<neon connection string>' ADMIN_EMAIL=you@yourcompany.com \
   npm run create-admin -- --generate --force
 ```
 
-It prints the password once, and the console makes you change it at first
-sign-in.
+Its first line names the database it is writing to -- check that it ends in
+`neon.tech`. If it says `localhost` and `from .env`, DATABASE_URL was not set in
+that terminal, and the account went to your local database instead. It prints
+the password once, and the console makes you change it at first sign-in.
 
 **4. Open it** at `https://<service-name>.onrender.com/__access/admin`.
 
