@@ -103,6 +103,7 @@ async function boot() {
     PORT: '0',
     EMAIL_PROVIDER: '',
     RESEND_API_KEY: '',
+    BREVO_API_KEY: '',
     EMAIL_FROM: '',
     SES_REGION: '',
     SES_ACCESS_KEY_ID: '',

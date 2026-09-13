@@ -40,9 +40,14 @@ services:
       # see each visitor's own address.
       - key: TRUST_PROXY
         value: "true"
-      # Optional. Left blank, grants still work and the console shows the
-      # password to relay by hand.
-      - key: RESEND_API_KEY
+      # Optional: real emails. Brevo's free plan works here with no domain --
+      # see "Email on the free plan" in DEPLOY.md. EMAIL_FROM must be the
+      # sender address verified in Brevo. Left blank, grants still work and
+      # the console shows the password to relay by hand.
+      - key: BREVO_API_KEY
         sync: false
       - key: EMAIL_FROM
+        sync: false
+      # Resend only delivers to other people once a domain is verified.
+      - key: RESEND_API_KEY
         sync: false

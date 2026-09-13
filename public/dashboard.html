@@ -60,7 +60,7 @@
 
   // The server owns the clock. The local tick is only there to keep the
   // digits moving between syncs, so a customer with a skewed system clock
-  // still sees the truth within a minute.
+  // still sees the truth within seconds.
   async function sync() {
     const res = await fetch('/__access/api/session', { credentials: 'same-origin' });
     if (!res.ok) {
@@ -95,7 +95,13 @@
     };
     tick();
     setInterval(tick, 1000);
-    setInterval(() => sync().catch(() => {}), 60000);
+    // Every 10 seconds, and at once when the tab is looked at again, so an
+    // admin revoke appears on screen within seconds. A failed request is
+    // ignored and retried; only a refusal from the server ends the session.
+    const resync = () => sync().catch(() => {});
+    setInterval(resync, 10000);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) resync(); });
+    window.addEventListener('focus', resync);
   }
 
   // The app lives at the origin root; the gateway forwards it once the
