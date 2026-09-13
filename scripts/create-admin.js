@@ -31,7 +31,27 @@
 // control, and a far better one than an internet-facing reset flow guarding
 // the credential that mints access to the internal network.
 
+// Recorded before dotenv runs. Whether DATABASE_URL came from the shell or was
+// filled in from .env is the difference between "the database you meant" and
+// "whatever the project file points at" -- and the second one is silent: an
+// admin meant for a hosted database lands on the laptop's, the script reports
+// success, and the account then fails to sign in anywhere that matters.
+const DATABASE_URL_FROM_SHELL = Boolean(process.env.DATABASE_URL);
 require('dotenv').config({ quiet: true });
+
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+// Where this run is about to write, without the credentials in the URL.
+function describeTarget() {
+  const source = DATABASE_URL_FROM_SHELL ? 'DATABASE_URL from your shell' : 'DATABASE_URL from .env';
+  try {
+    const url = new URL(process.env.DATABASE_URL);
+    const database = decodeURIComponent(url.pathname.replace(/^\//, '')) || '(default)';
+    return { host: url.hostname, text: `${url.hostname || '(no host)'} / ${database}  [${source}]` };
+  } catch {
+    return { host: '', text: `(unreadable -- check for extra characters around the string)  [${source}]` };
+  }
+}
 
 const crypto = require('crypto');
 const readline = require('readline');
@@ -135,6 +155,15 @@ async function ask(question, { silent = false } = {}) {
     // Unattended when a password is supplied without a terminal to type it
     // into. Everything below branches on this rather than on isInteractive,
     // so a piped stdin still drives the prompting path it always did.
+    // Said before anything else happens, so a wrong target is visible before
+    // an account is written to it. Not a prompt: this also runs unattended.
+    const target = describeTarget();
+    console.log(`Database: ${target.text}`);
+    if (!DATABASE_URL_FROM_SHELL && LOCAL_HOSTS.has(target.host)) {
+      console.warn('This is your LOCAL database. To create an admin for a deployed site, set '
+        + 'DATABASE_URL to that site\'s database in this same terminal first.');
+    }
+
     const suppliedPassword = process.env.ADMIN_PASSWORD || '';
     const unattended = GENERATE || Boolean(suppliedPassword);
 

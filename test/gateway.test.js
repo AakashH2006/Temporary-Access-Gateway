@@ -954,7 +954,12 @@ test('gateway', { skip: h.skip, concurrency: 1 }, async (t) => {
       }, (err, stdout, stderr) => (err ? reject(new Error(stderr || err.message)) : resolve(stdout)));
     });
 
-    await run();
+    const out = await run();
+    // The run names the database it wrote to -- and never the credentials in
+    // the connection string it was given.
+    assert.match(out, /Database: \S+/);
+    const dbPassword = new URL(process.env.TEST_DATABASE_URL).password;
+    if (dbPassword) assert.equal(out.includes(dbPassword), false, 'the connection password must never be printed');
     let { rows } = await h.query(
       "SELECT must_change_password FROM admins WHERE email = 'cli-admin@example.com'");
     assert.equal(rows[0].must_change_password, true, 'a new CLI admin must be forced to change it');
