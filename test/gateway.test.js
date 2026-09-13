@@ -8,6 +8,9 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const http = require('node:http');
+const crypto = require('node:crypto');
+const { execFile } = require('node:child_process');
 
 const h = require('./helpers.js');
 
@@ -799,5 +802,169 @@ test('gateway', { skip: h.skip, concurrency: 1 }, async (t) => {
     // A closed grant is no obstacle to issuing the next one.
     await h.query("UPDATE access_grants SET status = 'EXPIRED' WHERE email = 'contractor@firm.com'");
     await h.makeGrant({ email: 'contractor@firm.com', status: 'PENDING' });
+  });
+
+  // ----------------------------------------------------------------
+  // Websocket upgrades
+  // ----------------------------------------------------------------
+  // The one path that bypasses Express, and until these tests the one path
+  // with no coverage. It was also broken: with `ws: true` the proxy library
+  // subscribed its own, unauthenticated upgrade listener on the first proxied
+  // request. Every test here therefore makes an ordinary proxied request
+  // FIRST -- without it the old bug does not reproduce, which is exactly how
+  // it went unnoticed.
+  const upgrade = (extraHeaders = {}) => new Promise((resolve) => {
+    const { hostname, port } = new URL(h.base());
+    const req = http.request({
+      hostname,
+      port,
+      path: '/socket',
+      headers: {
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Key': crypto.randomBytes(16).toString('base64'),
+        'Sec-WebSocket-Version': '13',
+        ...extraHeaders,
+      },
+    });
+    const done = (result) => { clearTimeout(timer); resolve(result); };
+    const timer = setTimeout(() => { req.destroy(); done({ upgraded: false }); }, 2000);
+    req.on('upgrade', (res, socket) => { socket.destroy(); done({ upgraded: true, status: res.statusCode }); });
+    req.on('response', (res) => { res.resume(); done({ upgraded: false, status: res.statusCode }); });
+    req.on('error', () => done({ upgraded: false }));
+    req.end();
+  });
+
+  const primeProxy = async () => {
+    const grant = await h.makeGrant({ email: 'primer@example.com', password: 'primer-pass' });
+    const c = h.client();
+    await c.json('/__access/api/auth/login', { email: grant.email, password: 'primer-pass' });
+    const res = await c('/app.css');
+    assert.equal(res.status, 200, 'the priming request should go through the raw proxy');
+  };
+
+  await t.test('an upgrade with no session never reaches the app', async () => {
+    await primeProxy();
+    h.upstream.reset();
+
+    const result = await upgrade();
+    // Give a racing listener, if one existed, time to open the upstream leg.
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.equal(result.upgraded, false);
+    assert.equal(h.upstream.upgrades.length, 0, 'no upgrade may reach the upstream unauthenticated');
+  });
+
+  await t.test('an upgrade on a revoked grant never reaches the app', async () => {
+    await primeProxy();
+    const grant = await h.makeGrant({ email: 'revoked@example.com', status: 'REVOKED' });
+    h.upstream.reset();
+
+    const result = await upgrade({
+      cookie: `${h.COOKIE_NAME}=${h.sessionCookie(grant.id, grant.email)}`,
+    });
+    await new Promise((r) => setTimeout(r, 200));
+
+    assert.equal(result.upgraded, false);
+    assert.equal(h.upstream.upgrades.length, 0);
+  });
+
+  await t.test('a live upgrade reaches the app with the same header hygiene as HTTP', async () => {
+    await primeProxy();
+    const grant = await h.makeGrant({ email: 'socket@example.com' });
+    h.upstream.reset();
+
+    const result = await upgrade({
+      cookie: `${h.COOKIE_NAME}=${h.sessionCookie(grant.id, grant.email)}; app_pref=dark; ${h.ADMIN_COOKIE_NAME}=stray`,
+      'X-Temp-Access-Email': 'attacker@evil.com',
+      'X-Temp-Access-Grant': 'forged',
+      'Proxy-Authorization': 'Basic c2VjcmV0',
+    });
+
+    assert.equal(result.upgraded, true, 'an authorized socket must still work');
+    const forwarded = h.upstream.lastUpgrade.headers;
+    assert.equal(forwarded['x-temp-access-email'], 'socket@example.com');
+    assert.equal(forwarded['x-temp-access-grant'], grant.id);
+    assert.equal(forwarded['x-gateway-secret'], h.UPSTREAM_SECRET);
+    assert.equal(forwarded.cookie, 'app_pref=dark', 'only the app\'s own cookie may survive');
+    assert.equal(forwarded['proxy-authorization'], undefined);
+  });
+
+  // ----------------------------------------------------------------
+  // The console's markup is not a static asset
+  // ----------------------------------------------------------------
+  await t.test('console HTML is not served by filename, around the routes that guard it', async () => {
+    const c = h.client();
+    for (const file of ['admin.html', 'admin-login.html', 'login.html']) {
+      const res = await c(`/__access/${file}`);
+      const body = await res.text();
+      assert.equal(res.status, 404, `${file} should not be reachable as a static file`);
+      assert.doesNotMatch(body, /Access console/);
+    }
+    // Real assets still are.
+    const css = await c('/__access/styles.css');
+    assert.equal(css.status, 200);
+    assert.equal(h.upstream.requests.length, 0);
+  });
+
+  // ----------------------------------------------------------------
+  // Lockouts under concurrency
+  // ----------------------------------------------------------------
+  // The sequential lockout tests above passed against a read-modify-write
+  // counter. Parallel guesses are what that counter got wrong: they all read
+  // the same starting value, so the lockout never tripped.
+  await t.test('parallel wrong passwords still lock a grant', async () => {
+    const grant = await h.makeGrant({ password: 'correct-horse' });
+    await Promise.all([0, 1, 2].map((i) => h.client().json('/__access/api/auth/login', {
+      email: grant.email, password: `wrong-${i}`,
+    })));
+
+    const { rows } = await h.query(
+      'SELECT locked_until FROM access_grants WHERE id = $1', [grant.id]);
+    assert.notEqual(rows[0].locked_until, null, 'three concurrent failures must lock');
+
+    const right = await h.client().json('/__access/api/auth/login', {
+      email: grant.email, password: 'correct-horse',
+    });
+    assert.equal(right.status, 429);
+  });
+
+  await t.test('parallel wrong passwords still lock an admin', async () => {
+    const admin = await h.makeAdmin();
+    await Promise.all([0, 1, 2].map((i) => h.signIn(h.client(), {
+      email: admin.email, password: `wrong-${i}`,
+    })));
+
+    const { rows } = await h.query('SELECT locked_until FROM admins WHERE id = $1', [admin.id]);
+    assert.notEqual(rows[0].locked_until, null, 'three concurrent failures must lock');
+  });
+
+  // ----------------------------------------------------------------
+  // create-admin
+  // ----------------------------------------------------------------
+  await t.test('an admin made or reset by create-admin must change the password', async () => {
+    const run = () => new Promise((resolve, reject) => {
+      execFile(process.execPath, [path.join(__dirname, '..', 'scripts', 'create-admin.js'), '--force'], {
+        env: {
+          ...process.env,
+          DATABASE_URL: process.env.TEST_DATABASE_URL,
+          ADMIN_EMAIL: 'cli-admin@example.com',
+          ADMIN_PASSWORD: 'a-cli-typed-password-1',
+        },
+      }, (err, stdout, stderr) => (err ? reject(new Error(stderr || err.message)) : resolve(stdout)));
+    });
+
+    await run();
+    let { rows } = await h.query(
+      "SELECT must_change_password FROM admins WHERE email = 'cli-admin@example.com'");
+    assert.equal(rows[0].must_change_password, true, 'a new CLI admin must be forced to change it');
+
+    // The recovery path: the flag was cleared by a password change, and a
+    // reset through the script has to set it again.
+    await h.query("UPDATE admins SET must_change_password = false WHERE email = 'cli-admin@example.com'");
+    await run();
+    ({ rows } = await h.query(
+      "SELECT must_change_password FROM admins WHERE email = 'cli-admin@example.com'"));
+    assert.equal(rows[0].must_change_password, true, 'a CLI reset must force a change too');
   });
 });

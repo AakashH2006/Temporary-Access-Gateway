@@ -24,6 +24,14 @@ the secret.** A customer never receives VPN credentials, never gets a route
 into the internal network, and can only reach whatever single upstream
 `UPSTREAM_URL` names.
 
+**Who this is being deployed for: outside vendors, not employees.** Everyone
+on this page is an external party — a vendor's engineer, an auditor, an
+integration partner — who has no account in your directory and no VPN client,
+and who needs one application for hours or days. Employees keep using the VPN;
+this does not replace it, front it, or interact with it. That boundary is why
+several choices below are safe: a grant is disposable, owns nothing, and
+expires on a clock. See ["Who this is for"](README.md#who-this-is-for).
+
 **Showing it rather than shipping it?** `docker compose up --build` runs the
 whole system on a laptop, with a stand-in for the internal app -- see
 [README.md](README.md#running-the-demo). The rest of this file is the real
@@ -111,6 +119,8 @@ The values that actually decide whether this works:
 | `TRUST_PROXY` | `true` | Left `false` behind nginx, every visitor shares one rate-limit bucket and the audit log records nginx's IP for everyone. |
 | `JWT_SECRET` | 48 random bytes | Under 32 chars the gateway refuses to boot. Changing it later invalidates every live session. |
 | `DATABASE_SSL` | `true` for managed Postgres | Connection failures at boot. |
+| `DATABASE_CA_FILE` | Path to the provider's CA bundle, when `DATABASE_SSL=true` | A certificate error at boot. Certificates are verified; fetch the bundle rather than turning verification off. |
+| `DATABASE_SSL_INSECURE` | Leave unset | Set to `true`, the database connection is encrypted but unauthenticated, and anyone on the path can read every credential. |
 | `ADMIN_IP_ALLOWLIST` | your VPN/office CIDRs | Left empty, the admin console answers the public internet. This is the cheapest strong control available -- use it. |
 | `UPSTREAM_SHARED_SECRET` | 32 random bytes | Left empty, anyone who learns the app's own address bypasses the gateway entirely. See step 7b -- it needs a matching check in the app. |
 | `AUDIT_RETENTION_MONTHS` | your policy, default 12 | Only read by `npm run prune-audit`. Nothing is deleted until that runs. |

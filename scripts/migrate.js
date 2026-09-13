@@ -38,7 +38,7 @@ if (!process.env.DATABASE_URL) {
 function connectionConfig() {
   return {
     connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: false } : false,
+    ssl: require('../lib/db-ssl')(),
   };
 }
 

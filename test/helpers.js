@@ -31,14 +31,22 @@ const upstream = {
   server: null,
   port: 0,
   requests: [],
+  // Upgrades are recorded separately from requests because the interesting
+  // assertion is that most of them never arrive at all.
+  upgrades: [],
+  sockets: new Set(),
   csp: null,
   body: '<html><head><title>internal</title></head><body><h1>internal app</h1></body></html>',
   reset() {
     this.requests = [];
+    this.upgrades = [];
     this.csp = null;
   },
   get lastRequest() {
     return this.requests[this.requests.length - 1] || null;
+  },
+  get lastUpgrade() {
+    return this.upgrades[this.upgrades.length - 1] || null;
   },
 };
 
@@ -57,6 +65,27 @@ async function boot() {
       if (upstream.csp) headers['content-security-policy'] = upstream.csp;
       res.writeHead(200, headers);
       res.end(upstream.body);
+    });
+    // Completes a real handshake, so a test can tell "the gateway refused the
+    // socket" apart from "the socket reached the app" -- which is the whole
+    // question for the upgrade path.
+    s.on('upgrade', (req, socket) => {
+      upstream.upgrades.push({ url: req.url, headers: req.headers });
+      // An upgraded socket is detached from the server's connection tracking,
+      // so server.close() would wait on it forever. Tracked here so teardown
+      // can end it, rather than hanging the whole run.
+      upstream.sockets.add(socket);
+      socket.on('close', () => upstream.sockets.delete(socket));
+      const accept = crypto
+        .createHash('sha1')
+        .update(`${req.headers['sec-websocket-key'] || ''}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest('base64');
+      socket.write(
+        'HTTP/1.1 101 Switching Protocols\r\n'
+          + 'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+          + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`
+      );
+      socket.on('error', () => {});
     });
     s.listen(0, '127.0.0.1', () => resolve(s));
   });
@@ -148,12 +177,20 @@ async function assertDisposableTarget() {
 }
 
 async function teardown() {
+  // The upstream's sockets go first: a proxied websocket holds both ends
+  // open, so stopping the gateway while the app still has its end would leave
+  // each side waiting on the other.
+  for (const socket of upstream.sockets) socket.destroy();
   if (gateway) await gateway.stop();
   // boot() can fail before the gateway exists -- the disposable-target check
   // above is meant to -- and the pool it already opened would hold the process
   // open, turning a clear refusal into a hung test run.
   else if (server) await server.pool.end().catch(() => {});
-  if (upstream.server) await new Promise((r) => upstream.server.close(r));
+  if (upstream.server) {
+    for (const socket of upstream.sockets) socket.destroy();
+    upstream.server.closeAllConnections?.();
+    await new Promise((r) => upstream.server.close(r));
+  }
 }
 
 const query = (...args) => server.pool.query(...args);
@@ -221,7 +258,10 @@ async function makeGrant({
   failedAttempts = 0,
   lockedUntil = null,
 } = {}) {
-  const token = String(crypto.randomInt(100000000, 1000000000));
+  // Same shape the server mints: 32 random bytes as base64url. A fixture that
+  // built a token the route guard would reject would fail every activation
+  // test for a reason that had nothing to do with what was being tested.
+  const token = crypto.randomBytes(32).toString('base64url');
   const { rows } = await query(
     `INSERT INTO access_grants
        (email, token_hash, password_hash, duration_seconds, status,
@@ -281,6 +321,7 @@ module.exports = {
   query,
   sweep,
   client,
+  base,
   upstream,
   makeGrant,
   makeAdmin,
